@@ -1,0 +1,31 @@
+# Project specific folders
+input/
+output/
+Complt/
+
+# Python virtual environments
+venv/
+.venv/
+env/
+ENV/
+.env/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*.so
+
+# Distribution/packaging
+dist/
+build/
+*.egg-info/
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db

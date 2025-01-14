@@ -1,0 +1,59 @@
+TRAVIS OLSON_RUN NOTES
+
+# Quick Start Guide for MarkItDown (Windows)
+
+## Setup Steps (First Time Only)
+1. Open PowerShell
+2. Navigate to your markitdown folder:
+   ```
+   cd A:\markitdown
+   ```
+3. Activate the virtual environment:
+   ```
+   .\venv\Scripts\activate
+   ```
+   - You'll know it worked when you see `(venv)` at the start of your command line
+
+## Converting Files
+1. Make sure you're in the markitdown folder and the virtual environment is active (you should see `(venv)` at the start of the line)
+2. Use this command to convert your file:
+   
+## Examples
+Convert a PDF:
+```
+python -m markitdown "A:\markitdown\input" -o "A:\markitdown\output" -p "*.pdf"
+```
+
+Convert a Word document:
+```
+python -m markitdown mydoc.docx > mydoc.md
+
+
+#### BATCH PROCESS ALL EMAILS
+python -m markitdown input_emails -o output_markdown
+
+```
+
+## Tips
+- Your input file can be in a different folder. Just include the full path:
+  ```
+  python -m markitdown "C:\Users\YourName\Documents\file.pdf" > output.md
+  ```
+- If a file path has spaces, put it in quotes:
+  ```
+  python -m markitdown "A:\My Documents\my file.docx" > output.md
+  ```
+- To close the virtual environment when you're done:
+  ```
+  deactivate
+  ```
+
+## Supported File Types
+- PDF (.pdf)
+- Word Documents (.docx)
+- Excel Spreadsheets (.xlsx)
+- PowerPoint Presentations (.pptx)
+- HTML files (.html, .htm)
+- Text files (.txt)
+- Images (.jpg, .jpeg, .png)
+- Audio files (.mp3, .wav) - requires additional setup
