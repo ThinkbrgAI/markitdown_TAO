@@ -15,10 +15,13 @@ import traceback
 import warnings
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import parse_qs, quote, unquote, urlparse, urlunparse
+from enum import Enum
+import ast
 
 # Suppress pydub warning about ffmpeg
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="pydub.utils")
 
+# Core imports
 import mammoth
 import markdownify
 import pandas as pd
@@ -26,1703 +29,1237 @@ import pdfminer
 import pdfminer.high_level
 import pdfplumber
 import pptx
-
-# File-format detection
 import puremagic
 import requests
 from bs4 import BeautifulSoup
 
-# Optional Outlook support
+# PDF processing
+import camelot
+import tabula
+from pdf2image import convert_from_path
+
+# Optional imports with fallbacks
 try:
     import extract_msg
     IS_OUTLOOK_CAPABLE = True
 except ModuleNotFoundError:
     IS_OUTLOOK_CAPABLE = False
 
-# Optional Transcription support
 try:
-    import pydub
-    import speech_recognition as sr
+    from transformers import LayoutLMv3ForSequenceClassification, LayoutLMv3Processor
+    import torch
+    HAS_LAYOUTLM = True
+except ImportError:
+    HAS_LAYOUTLM = False
+    warnings.warn("LayoutLMv3 not available. Install with 'pip install transformers torch'")
 
-    IS_AUDIO_TRANSCRIPTION_CAPABLE = True
-except ModuleNotFoundError:
+class TableExtractionStrategy(Enum):
+    """Strategies for table extraction from documents"""
+    HEURISTIC = "heuristic"  # Default strategy
+    LAYOUTLM = "layoutlm"    # Uses LayoutLMv3
+    GPT4V = "gpt4v"         # Uses GPT-4V
+    AUTO = "auto"           # Tries heuristic first, falls back to ML if needed
+
+class FileConversionException(Exception):
+    """Exception raised for errors during file conversion."""
     pass
 
-# Optional YouTube transcription support
-try:
-    from youtube_transcript_api import YouTubeTranscriptApi
-
-    IS_YOUTUBE_TRANSCRIPT_CAPABLE = True
-except ModuleNotFoundError:
+class UnsupportedFormatException(Exception):
+    """Exception raised for unsupported file formats."""
     pass
 
-
-class _CustomMarkdownify(markdownify.MarkdownConverter):
-    """
-    A custom version of markdownify's MarkdownConverter. Changes include:
-
-    - Altering the default heading style to use '#', '##', etc.
-    - Removing javascript hyperlinks.
-    - Truncating images with large data:uri sources.
-    - Ensuring URIs are properly escaped, and do not conflict with Markdown syntax
-    """
-
-    def __init__(self, **options: Any):
-        options["heading_style"] = options.get("heading_style", markdownify.ATX)
-        # Explicitly cast options to the expected type if necessary
-        super().__init__(**options)
-
-    def convert_hn(self, n: int, el: Any, text: str, convert_as_inline: bool) -> str:
-        """Same as usual, but be sure to start with a new line"""
-        if not convert_as_inline:
-            if not re.search(r"^\n", text):
-                return "\n" + super().convert_hn(n, el, text, convert_as_inline)  # type: ignore
-
-        return super().convert_hn(n, el, text, convert_as_inline)  # type: ignore
-
-    def convert_a(self, el: Any, text: str, convert_as_inline: bool):
-        """Same as usual converter, but removes Javascript links and escapes URIs."""
-        prefix, suffix, text = markdownify.chomp(text)  # type: ignore
-        if not text:
-            return ""
-        href = el.get("href")
-        title = el.get("title")
-
-        # Escape URIs and skip non-http or file schemes
-        if href:
-            try:
-                parsed_url = urlparse(href)  # type: ignore
-                if parsed_url.scheme and parsed_url.scheme.lower() not in ["http", "https", "file"]:  # type: ignore
-                    return "%s%s%s" % (prefix, text, suffix)
-                href = urlunparse(parsed_url._replace(path=quote(unquote(parsed_url.path))))  # type: ignore
-            except ValueError:  # It's not clear if this ever gets thrown
-                return "%s%s%s" % (prefix, text, suffix)
-
-        # For the replacement see #29: text nodes underscores are escaped
-        if (
-            self.options["autolinks"]
-            and text.replace(r"\_", "_") == href
-            and not title
-            and not self.options["default_title"]
-        ):
-            # Shortcut syntax
-            return "<%s>" % href
-        if self.options["default_title"] and not title:
-            title = href
-        title_part = ' "%s"' % title.replace('"', r"\"") if title else ""
-        return (
-            "%s[%s](%s%s)%s" % (prefix, text, href, title_part, suffix)
-            if href
-            else text
-        )
-
-    def convert_img(self, el: Any, text: str, convert_as_inline: bool) -> str:
-        """Same as usual converter, but removes data URIs"""
-
-        alt = el.attrs.get("alt", None) or ""
-        src = el.attrs.get("src", None) or ""
-        title = el.attrs.get("title", None) or ""
-        title_part = ' "%s"' % title.replace('"', r"\"") if title else ""
-        if (
-            convert_as_inline
-            and el.parent.name not in self.options["keep_inline_images_in"]
-        ):
-            return alt
-
-        # Remove dataURIs
-        if src.startswith("data:"):
-            src = src.split(",")[0] + "..."
-
-        return "![%s](%s%s)" % (alt, src, title_part)
-
-    def convert_soup(self, soup: Any) -> str:
-        return super().convert_soup(soup)  # type: ignore
-
-
-class DocumentConverterResult:
-    """The result of converting a document to text."""
-
-    def __init__(self, title: Union[str, None] = None, text_content: str = ""):
-        self.title: Union[str, None] = title
-        self.text_content: str = text_content
-
-
-class DocumentConverter:
-    """Abstract superclass of all DocumentConverters."""
-
-    def convert(
-        self, local_path: str, **kwargs: Any
-    ) -> Union[None, DocumentConverterResult]:
-        raise NotImplementedError()
-
-
-class PlainTextConverter(DocumentConverter):
-    """Anything with content type text/plain"""
-
-    def convert(
-        self, local_path: str, **kwargs: Any
-    ) -> Union[None, DocumentConverterResult]:
-        # Guess the content type from any file extension that might be around
-        content_type, _ = mimetypes.guess_type(
-            "__placeholder" + kwargs.get("file_extension", "")
-        )
-
-        # Only accept text files
-        if content_type is None:
-            return None
-        elif "text/" not in content_type.lower():
-            return None
-
-        text_content = ""
-        with open(local_path, "rt", encoding="utf-8") as fh:
-            text_content = fh.read()
-        return DocumentConverterResult(
-            title=None,
-            text_content=text_content,
-        )
-
-
-class HtmlConverter(DocumentConverter):
-    """Anything with content type text/html"""
-
-    def convert(
-        self, local_path: str, **kwargs: Any
-    ) -> Union[None, DocumentConverterResult]:
-        # Bail if not html
-        extension = kwargs.get("file_extension", "")
-        if extension.lower() not in [".html", ".htm"]:
-            return None
-
-        result = None
-        with open(local_path, "rt", encoding="utf-8") as fh:
-            result = self._convert(fh.read())
-
-        return result
-
-    def _convert(self, html_content: str) -> Union[None, DocumentConverterResult]:
-        """Helper function that converts and HTML string."""
-
-        # Parse the string
-        soup = BeautifulSoup(html_content, "html.parser")
-
-        # Remove javascript and style blocks
-        for script in soup(["script", "style"]):
-            script.extract()
-
-        # Print only the main content
-        body_elm = soup.find("body")
-        webpage_text = ""
-        if body_elm:
-            webpage_text = _CustomMarkdownify().convert_soup(body_elm)
-        else:
-            webpage_text = _CustomMarkdownify().convert_soup(soup)
-
-        assert isinstance(webpage_text, str)
-
-        return DocumentConverterResult(
-            title=None if soup.title is None else soup.title.string,
-            text_content=webpage_text,
-        )
-
-
-class WikipediaConverter(DocumentConverter):
-    """Handle Wikipedia pages separately, focusing only on the main document content."""
-
-    def convert(
-        self, local_path: str, **kwargs: Any
-    ) -> Union[None, DocumentConverterResult]:
-        # Bail if not Wikipedia
-        extension = kwargs.get("file_extension", "")
-        if extension.lower() not in [".html", ".htm"]:
-            return None
-        url = kwargs.get("url", "")
-        if not re.search(r"^https?:\/\/[a-zA-Z]{2,3}\.wikipedia.org\/", url):
-            return None
-
-        # Parse the file
-        soup = None
-        with open(local_path, "rt", encoding="utf-8") as fh:
-            soup = BeautifulSoup(fh.read(), "html.parser")
-
-        # Remove javascript and style blocks
-        for script in soup(["script", "style"]):
-            script.extract()
-
-        # Print only the main content
-        body_elm = soup.find("div", {"id": "mw-content-text"})
-        title_elm = soup.find("span", {"class": "mw-page-title-main"})
-
-        webpage_text = ""
-        main_title = None if soup.title is None else soup.title.string
-
-        if body_elm:
-            # What's the title
-            if title_elm and len(title_elm) > 0:
-                main_title = title_elm.string  # type: ignore
-                assert isinstance(main_title, str)
-
-            # Convert the page
-            webpage_text = f"# {main_title}\n\n" + _CustomMarkdownify().convert_soup(
-                body_elm
-            )
-        else:
-            webpage_text = _CustomMarkdownify().convert_soup(soup)
-
-        return DocumentConverterResult(
-            title=main_title,
-            text_content=webpage_text,
-        )
-
-
-class YouTubeConverter(DocumentConverter):
-    """Handle YouTube specially, focusing on the video title, description, and transcript."""
-
-    def convert(
-        self, local_path: str, **kwargs: Any
-    ) -> Union[None, DocumentConverterResult]:
-        # Bail if not YouTube
-        extension = kwargs.get("file_extension", "")
-        if extension.lower() not in [".html", ".htm"]:
-            return None
-        url = kwargs.get("url", "")
-        if not url.startswith("https://www.youtube.com/watch?"):
-            return None
-
-        # Parse the file
-        soup = None
-        with open(local_path, "rt", encoding="utf-8") as fh:
-            soup = BeautifulSoup(fh.read(), "html.parser")
-
-        # Read the meta tags
-        assert soup.title is not None and soup.title.string is not None
-        metadata: Dict[str, str] = {"title": soup.title.string}
-        for meta in soup(["meta"]):
-            for a in meta.attrs:
-                if a in ["itemprop", "property", "name"]:
-                    metadata[meta[a]] = meta.get("content", "")
-                    break
-
-        # We can also try to read the full description. This is more prone to breaking, since it reaches into the page implementation
-        try:
-            for script in soup(["script"]):
-                content = script.text
-                if "ytInitialData" in content:
-                    lines = re.split(r"\r?\n", content)
-                    obj_start = lines[0].find("{")
-                    obj_end = lines[0].rfind("}")
-                    if obj_start >= 0 and obj_end >= 0:
-                        data = json.loads(lines[0][obj_start : obj_end + 1])
-                        attrdesc = self._findKey(data, "attributedDescriptionBodyText")  # type: ignore
-                        if attrdesc:
-                            metadata["description"] = str(attrdesc["content"])
-                    break
-        except Exception:
-            pass
-
-        # Start preparing the page
-        webpage_text = "# YouTube\n"
-
-        title = self._get(metadata, ["title", "og:title", "name"])  # type: ignore
-        assert isinstance(title, str)
-
-        if title:
-            webpage_text += f"\n## {title}\n"
-
-        stats = ""
-        views = self._get(metadata, ["interactionCount"])  # type: ignore
-        if views:
-            stats += f"- **Views:** {views}\n"
-
-        keywords = self._get(metadata, ["keywords"])  # type: ignore
-        if keywords:
-            stats += f"- **Keywords:** {keywords}\n"
-
-        runtime = self._get(metadata, ["duration"])  # type: ignore
-        if runtime:
-            stats += f"- **Runtime:** {runtime}\n"
-
-        if len(stats) > 0:
-            webpage_text += f"\n### Video Metadata\n{stats}\n"
-
-        description = self._get(metadata, ["description", "og:description"])  # type: ignore
-        if description:
-            webpage_text += f"\n### Description\n{description}\n"
-
-        if IS_YOUTUBE_TRANSCRIPT_CAPABLE:
-            transcript_text = ""
-            parsed_url = urlparse(url)  # type: ignore
-            params = parse_qs(parsed_url.query)  # type: ignore
-            if "v" in params:
-                assert isinstance(params["v"][0], str)
-                video_id = str(params["v"][0])
-                try:
-                    # Must be a single transcript.
-                    transcript = YouTubeTranscriptApi.get_transcript(video_id)  # type: ignore
-                    transcript_text = " ".join([part["text"] for part in transcript])  # type: ignore
-                    # Alternative formatting:
-                    # formatter = TextFormatter()
-                    # formatter.format_transcript(transcript)
-                except Exception:
-                    pass
-            if transcript_text:
-                webpage_text += f"\n### Transcript\n{transcript_text}\n"
-
-        title = title if title else soup.title.string
-        assert isinstance(title, str)
-
-        return DocumentConverterResult(
-            title=title,
-            text_content=webpage_text,
-        )
-
-    def _get(
-        self,
-        metadata: Dict[str, str],
-        keys: List[str],
-        default: Union[str, None] = None,
-    ) -> Union[str, None]:
-        for k in keys:
-            if k in metadata:
-                return metadata[k]
-        return default
-
-    def _findKey(self, json: Any, key: str) -> Union[str, None]:  # TODO: Fix json type
-        if isinstance(json, list):
-            for elm in json:
-                ret = self._findKey(elm, key)
-                if ret is not None:
-                    return ret
-        elif isinstance(json, dict):
-            for k in json:
-                if k == key:
-                    return json[k]
-                else:
-                    ret = self._findKey(json[k], key)
-                    if ret is not None:
-                        return ret
-        return None
-
-
-class BingSerpConverter(DocumentConverter):
-    """
-    Handle Bing results pages (only the organic search results).
-    NOTE: It is better to use the Bing API
-    """
-
-    def convert(self, local_path, **kwargs) -> Union[None, DocumentConverterResult]:
-        # Bail if not a Bing SERP
-        extension = kwargs.get("file_extension", "")
-        if extension.lower() not in [".html", ".htm"]:
-            return None
-        url = kwargs.get("url", "")
-        if not re.search(r"^https://www\.bing\.com/search\?q=", url):
-            return None
-
-        # Parse the query parameters
-        parsed_params = parse_qs(urlparse(url).query)
-        query = parsed_params.get("q", [""])[0]
-
-        # Parse the file
-        soup = None
-        with open(local_path, "rt", encoding="utf-8") as fh:
-            soup = BeautifulSoup(fh.read(), "html.parser")
-
-        # Clean up some formatting
-        for tptt in soup.find_all(class_="tptt"):
-            if hasattr(tptt, "string") and tptt.string:
-                tptt.string += " "
-        for slug in soup.find_all(class_="algoSlug_icon"):
-            slug.extract()
-
-        # Parse the algorithmic results
-        _markdownify = _CustomMarkdownify()
-        results = list()
-        for result in soup.find_all(class_="b_algo"):
-            # Rewrite redirect urls
-            for a in result.find_all("a", href=True):
-                parsed_href = urlparse(a["href"])
-                qs = parse_qs(parsed_href.query)
-
-                # The destination is contained in the u parameter,
-                # but appears to be base64 encoded, with some prefix
-                if "u" in qs:
-                    u = (
-                        qs["u"][0][2:].strip() + "=="
-                    )  # Python 3 doesn't care about extra padding
-
-                    try:
-                        # RFC 4648 / Base64URL" variant, which uses "-" and "_"
-                        a["href"] = base64.b64decode(u, altchars="-_").decode("utf-8")
-                    except UnicodeDecodeError:
-                        pass
-                    except binascii.Error:
-                        pass
-
-            # Convert to markdown
-            md_result = _markdownify.convert_soup(result).strip()
-            lines = [line.strip() for line in re.split(r"\n+", md_result)]
-            results.append("\n".join([line for line in lines if len(line) > 0]))
-
-        webpage_text = (
-            f"## A Bing search for '{query}' found the following results:\n\n"
-            + "\n\n".join(results)
-        )
-
-        return DocumentConverterResult(
-            title=None if soup.title is None else soup.title.string,
-            text_content=webpage_text,
-        )
-
-
-class PdfConverter(DocumentConverter):
-    """
-    Converts PDFs to Markdown, preserving tables and basic formatting.
-    """
+class ConversionResult:
+    """Container for conversion results"""
+    def __init__(self, text_content: str = "", metadata: Dict = None, images: List[str] = None):
+        self.text_content = text_content
+        self.metadata = metadata or {}
+        self.images = images or []
+
+    def __str__(self):
+        return f"ConversionResult(text_length={len(self.text_content)}, images={len(self.images)})"
+
+class TableCell:
+    """Represents a cell in a table with merge and style information"""
+    def __init__(self, content: str, rowspan: int = 1, colspan: int = 1):
+        self.content = content
+        self.rowspan = rowspan
+        self.colspan = colspan
+        self.is_merged_cell = False
+        self.styles = []  # List of styles: 'bold', 'italic', 'code', etc.
+        
+        # Detect and strip markdown styling
+        self._detect_styles()
     
-    def _is_sentence_end(self, text: str) -> bool:
-        """Check if text ends with a sentence-ending character."""
-        sentence_endings = ['.', '!', '?', ':', ';']
-        return any(text.rstrip().endswith(end) for end in sentence_endings)
+    def _detect_styles(self):
+        """Detect markdown styling in content"""
+        # Bold detection (both ** and __)
+        if (self.content.startswith('**') and self.content.endswith('**')) or \
+           (self.content.startswith('__') and self.content.endswith('__')):
+            self.styles.append('bold')
+            self.content = self.content[2:-2]
+        
+        # Italic detection (both * and _)
+        elif (self.content.startswith('*') and self.content.endswith('*')) or \
+             (self.content.startswith('_') and self.content.endswith('_')):
+            self.styles.append('italic')
+            self.content = self.content[1:-1]
+        
+        # Code detection
+        elif self.content.startswith('`') and self.content.endswith('`'):
+            self.styles.append('code')
+            self.content = self.content[1:-1]
+        
+        # Mixed bold-italic
+        elif (self.content.startswith('***') and self.content.endswith('***')) or \
+             (self.content.startswith('___') and self.content.endswith('___')):
+            self.styles.extend(['bold', 'italic'])
+            self.content = self.content[3:-3]
 
-    def _detect_table_row(self, line: str) -> List[str]:
-        """
-        Detect if a line looks like it's part of a table based on consistent spacing.
-        Returns list of cells if it's a table row, None otherwise.
-        """
-        # Known header patterns for tables
-        header_patterns = [
-            ["Name", "BarNumber", "Email", "TimestampSubmitted", "Status"],
-            ["Name", "Bar Number", "Email", "Timestamp", "Status"]
+    def apply_styles(self, content: str) -> str:
+        """Apply stored styles to content"""
+        styled_content = content
+        
+        # Apply styles in reverse order (inside out)
+        for style in reversed(self.styles):
+            if style == 'bold':
+                styled_content = f"**{styled_content}**"
+            elif style == 'italic':
+                styled_content = f"_{styled_content}_"
+            elif style == 'code':
+                styled_content = f"`{styled_content}`"
+        
+        return styled_content
+
+class PdfTableExtractor:
+    """Advanced PDF table extraction using multiple strategies"""
+    
+    def __init__(self, llm_client=None):
+        self.llm_client = llm_client
+        self.last_cost = 0.0
+        self.seen_tables = set()
+        self.strategies = [
+            self._extract_with_camelot,
+            self._extract_with_tabula,
+            self._extract_with_pdfplumber,
+            self._extract_with_layoutlm,
+            self._extract_with_gpt4v,
+            self._extract_with_heuristics
         ]
-        
-        # First check if this might be a header row
-        words = line.split()
-        if len(words) >= 3:
-            for pattern in header_patterns:
-                # Check if all pattern words appear in the line
-                if all(p.lower() in line.lower() for p in pattern):
-                    return pattern
-        
-        # Skip very short lines
-        if len(line) < 20:
-            return None
-            
-        # Look for email addresses and timestamps
-        email_pattern = r'[\w\.-]+@[\w\.-]+\.\w+'
-        timestamp_pattern = r'\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s*(?:AM|PM)?'
-        
-        # Find all email addresses and timestamps
-        emails = re.findall(email_pattern, line)
-        timestamps = re.findall(timestamp_pattern, line)
-        
-        if emails or timestamps:
-            # Split the line at email addresses and timestamps
-            parts = line
-            for email in emails:
-                parts = parts.replace(email, f"|{email}|")
-            for timestamp in timestamps:
-                parts = parts.replace(timestamp, f"|{timestamp}|")
-                
-            # Split by the pipe character and clean up
-            cells = [cell.strip() for cell in parts.split('|') if cell.strip()]
-            
-            # If we got cells, try to align them with the header pattern
-            if cells and len(cells) >= 3:
-                # Look for name at start, email, timestamp, and status
-                aligned_cells = [''] * 5  # 5 columns as per header pattern
-                
-                for cell in cells:
-                    if '@' in cell:  # Email
-                        aligned_cells[2] = cell
-                    elif re.match(timestamp_pattern, cell):  # Timestamp
-                        aligned_cells[3] = cell
-                    elif cell.upper() == 'SENT':  # Status
-                        aligned_cells[4] = cell
-                    elif aligned_cells[0] == '':  # Name (if not already set)
-                        aligned_cells[0] = cell
-                
-                return aligned_cells
-        
-        return None
 
-    def _is_roman_numeral(self, text: str) -> bool:
-        """Check if text is a Roman numeral."""
-        pattern = r"^[IVXLCDM]+\.?$"
-        return bool(re.match(pattern, text.upper()))
+    def reset_state(self):
+        """Reset state for new document"""
+        self.seen_tables.clear()
+        self.last_cost = 0.0
 
-    def _convert_roman_numeral(self, text: str) -> str:
-        """Convert Roman numeral to standard format."""
-        # Remove any trailing period
-        text = text.rstrip('.')
-        # Keep original case but standardize format
-        return text.upper()
+    def extract_tables(self, pdf_path: str) -> List[List[List[str]]]:
+        """
+        Extract tables using multiple strategies and combine results
+        Returns list of tables, where each table is a list of rows
+        """
+        all_tables = []
+        tables_confidence = {}  # Store confidence scores for each table
 
-    def _is_header(self, line: str) -> bool:
-        """Check if line looks like a header."""
-        # Skip page numbers and footers
-        if re.match(r'^\d+$', line.strip()):  # Just a number
-            return False
-        if re.match(r'^Page \d+( of \d+)?$', line, re.IGNORECASE):  # Page X or Page X of Y
-            return False
-            
-        # Remove indentation for checking
-        line = line.strip()
-        
-        # Skip if line is too short or contains lowercase letters
-        if len(line) < 4 or not line.isupper():
-            return False
-            
-        # Skip if line starts with common sentence words
-        skip_starts = ['THE', 'AND', 'OR', 'BUT', 'NOR', 'FOR', 'YET', 'SO', 'AS', 'IN', 'TO', 'BY']
-        if any(line.startswith(word + ' ') for word in skip_starts):
-            return False
-            
-        # Check for common header patterns
-        patterns = [
-            r"^[IVX]+\.\s*\S",  # Roman numerals followed by period and content
-            r"^[A-Z][\.|\)]\s+[A-Z]",  # Single letter followed by period/parenthesis and caps
-            r"^\d+\.\d*\s+[A-Z]",  # Numbered sections with caps content
-            r"^(?:ARTICLE|SECTION|EXHIBIT)\s+[IVXLCDM0-9]+",  # Common legal document headers
-            r"^(?:ARTICLE|SECTION|EXHIBIT)\s+[A-Z]",  # Common legal document headers with letters
-            r"^[A-Z][A-Z\s]{2,}[A-Z]$",  # All caps text (at least 4 chars) that doesn't look like sentence
-        ]
-        
-        # Must match a pattern and not look like a sentence continuation
-        return (
-            any(re.match(p, line) for p in patterns) and
-            not any(line.startswith(word + ' ') for word in skip_starts)
-        )
+        # Try each strategy
+        for strategy in self.strategies:
+            try:
+                tables = strategy(pdf_path)
+                for table in tables:
+                    confidence = self._calculate_table_confidence(table)
+                    table_hash = self._hash_table(table)
+                    if table_hash not in tables_confidence or confidence > tables_confidence[table_hash][0]:
+                        tables_confidence[table_hash] = (confidence, table)
+            except Exception as e:
+                print(f"Strategy {strategy.__name__} failed: {str(e)}", file=sys.stderr)
 
-    def _format_header(self, line: str) -> str:
-        """Format a header line appropriately."""
-        # Remove trailing punctuation
-        line = line.rstrip('.:')
-        
-        # Check for Roman numerals at start
-        roman_match = re.match(r"^([IVX]+)\.?\s*(.*)", line)
-        if roman_match:
-            roman, rest = roman_match.groups()
-            return f"## {self._convert_roman_numeral(roman)}.{' ' + rest.title() if rest else ''}"
-            
-        # Check for lettered sections
-        if re.match(r"^[A-Z][\.|\)]\s+", line):
-            return f"### {line.title()}"
-            
-        # Check for numbered sections
-        if re.match(r"^\d+\.\d*\s+", line):
-            return f"## {line.title()}"
-            
-        # Default case - all caps text
-        return f"### {line.title()}"
+        # Return unique tables with highest confidence
+        return [table for _, table in sorted(tables_confidence.values(), reverse=True)]
 
-    def _process_text(self, text: str) -> List[str]:
-        """Process text into properly formatted paragraphs and lines."""
-        lines = []
-        current_paragraph = []
-        
-        # Split by explicit line breaks first
-        raw_lines = text.split('\n')
-        
-        for line in raw_lines:
-            line = line.strip()
-            
-            # Skip empty lines - marks paragraph boundary
-            if not line:
-                if current_paragraph:
-                    # Join the paragraph with spaces and add it
-                    lines.append(' '.join(current_paragraph))
-                    lines.append('')  # Add blank line between paragraphs
-                    current_paragraph = []
-                continue
-            
-            # Skip page numbers and footers
-            if re.match(r'^\d+$', line.strip()) or re.match(r'^Page \d+( of \d+)?$', line, re.IGNORECASE):
-                continue
-            
-            # Check if this line is a header
-            if self._is_header(line):
-                if current_paragraph:
-                    lines.append(' '.join(current_paragraph))
-                    lines.append('')  # Add blank line before header
-                    current_paragraph = []
-                lines.append(self._format_header(line))
-                lines.append('')
-                continue
-            
-            # Add words to current paragraph
-            words = line.split()
-            current_paragraph.extend(words)
-            
-            # Check if this line ends with a sentence-ending character
-            if words and self._is_sentence_end(words[-1]):
-                lines.append(' '.join(current_paragraph))
-                lines.append('')  # Add blank line after sentence
-                current_paragraph = []
-        
-        # Add any remaining content
-        if current_paragraph:
-            lines.append(' '.join(current_paragraph))
-            lines.append('')  # Add final blank line
-        
-        # Clean up multiple consecutive blank lines
-        cleaned_lines = []
-        last_was_blank = False
-        for line in lines:
-            if line.strip():
-                cleaned_lines.append(line)
-                last_was_blank = False
-            elif not last_was_blank:
-                cleaned_lines.append(line)
-                last_was_blank = True
-        
-        return cleaned_lines
-
-    def convert(self, local_path, **kwargs) -> Union[None, DocumentConverterResult]:
-        # Bail if not a PDF
-        extension = kwargs.get("file_extension", "")
-        if extension.lower() != ".pdf":
-            return None
-
+    def _extract_with_camelot(self, pdf_path: str) -> List[List[List[str]]]:
+        """Extract tables using Camelot - best for bordered tables"""
+        tables = []
         try:
-            # Get filename for title
-            filename = os.path.basename(local_path)
-            title = os.path.splitext(filename)[0]
-            
-            processed_lines = []
-            
-            # Add title
-            processed_lines.append(f"# {title}")
-            processed_lines.append("")
-            
-            # Process PDF with pdfplumber
-            with pdfplumber.open(local_path) as pdf:
-                for page_num, page in enumerate(pdf.pages, 1):
-                    # Add page number as heading
-                    processed_lines.append(f"## Page {page_num}")
-                    processed_lines.append("")
-                    
-                    # Extract tables from the page
-                    tables = page.extract_tables()
-                    
-                    # Get text excluding table areas
-                    text = page.extract_text()
-                    lines = text.split('\n')
-                    
-                    # Process text looking for both explicit tables and implicit tabular data
-                    current_table = []
-                    current_text = []
-                    
-                    for line in lines:
-                        line = line.strip()
-                        if not line:
-                            # End of table if we were building one
-                            if current_table:
-                                processed_lines.extend(self._format_table(current_table))
-                                current_table = []
-                            if current_text:
-                                processed_lines.extend(self._process_text('\n'.join(current_text)))
-                                current_text = []
-                            processed_lines.append("")
-                            continue
-                        
-                        # Try to detect if this line is part of a table
-                        table_cells = self._detect_table_row(line)
-                        if table_cells:
-                            # This line looks like a table row
-                            if current_text:
-                                processed_lines.extend(self._process_text('\n'.join(current_text)))
-                                current_text = []
-                            current_table.append(table_cells)
-                        else:
-                            # Not a table row
-                            # If we were building a table, format and add it
-                            if current_table:
-                                processed_lines.extend(self._format_table(current_table))
-                                current_table = []
-                            
-                            # Check if line looks like a heading
-                            if len(line) < 100 and line.isupper():
-                                if current_text:
-                                    processed_lines.extend(self._process_text('\n'.join(current_text)))
-                                    current_text = []
-                                processed_lines.append(f"### {line.title()}")
-                                processed_lines.append("")
-                            else:
-                                # Regular text
-                                current_text.append(line)
-                    
-                    # Don't forget to add any remaining content
-                    if current_table:
-                        processed_lines.extend(self._format_table(current_table))
-                    if current_text:
-                        processed_lines.extend(self._process_text('\n'.join(current_text)))
-                    
-                    # Add explicit tables from pdfplumber if any
-                    if tables:
-                        for table in tables:
-                            if table and any(table):
-                                processed_lines.append("")
-                                processed_lines.extend(self._format_table(table))
-                                processed_lines.append("")
-                    
-                    # Add extra space between pages
-                    processed_lines.append("")
-                    processed_lines.append("---")
-                    processed_lines.append("")
-            
-            # Join with Windows line endings
-            markdown_content = "\r\n".join(processed_lines)
-            
-            return DocumentConverterResult(
-                title=title,
-                text_content=markdown_content
-            )
-            
-        except Exception as e:
-            print(f"Warning: Error converting PDF {local_path}: {str(e)}", file=sys.stderr)
-            return None
+            # Check if PDF is image-based
+            with pdfplumber.open(pdf_path) as pdf:
+                if not pdf.pages[0].extract_text().strip():
+                    print("PDF appears to be image-based, skipping Camelot", file=sys.stderr)
+                    return []
 
-    def _format_table(self, table: List[List[str]]) -> List[str]:
-        """Format a table in Markdown."""
-        if not table or not table[0]:
+            # Try lattice mode
+            camelot_tables = camelot.read_pdf(
+                pdf_path, 
+                flavor='lattice',
+                flag_size=True,
+                line_scale=40
+            )
+            for table in camelot_tables:
+                if table.parsing_report['accuracy'] > 80:
+                    tables.append(table.data)
+                    
+            # Try stream mode if no tables found
+            if not tables:
+                camelot_tables = camelot.read_pdf(
+                    pdf_path, 
+                    flavor='stream',
+                    flag_size=True
+                )
+                for table in camelot_tables:
+                    if table.parsing_report['accuracy'] > 80:
+                        tables.append(table.data)
+                    
+        except Exception as e:
+            print(f"Camelot extraction failed: {str(e)}", file=sys.stderr)
+        return tables
+
+    def _extract_with_tabula(self, pdf_path: str) -> List[List[List[str]]]:
+        """Extract tables using Tabula - good for spreadsheet-like tables"""
+        tables = []
+        try:
+            # Use lattice mode
+            df_list = tabula.read_pdf(
+                pdf_path,
+                pages='all',
+                multiple_tables=True,
+                lattice=True  # Changed from method='lattice'
+            )
+            if df_list:
+                for df in df_list:
+                    if not df.empty:
+                        tables.append(df.values.tolist())
+                    
+            # Try stream mode
+            df_list = tabula.read_pdf(
+                pdf_path,
+                pages='all',
+                multiple_tables=True,
+                stream=True  # Changed from method='stream'
+            )
+            if df_list:
+                for df in df_list:
+                    if not df.empty:
+                        tables.append(df.values.tolist())
+                    
+        except Exception as e:
+            print(f"Tabula extraction failed: {str(e)}", file=sys.stderr)
+        return tables
+
+    def _extract_with_pdfplumber(self, pdf_path: str) -> List[List[List[str]]]:
+        """Extract tables using pdfplumber - good for simple tables"""
+        tables = []
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page in pdf.pages:
+                    page_tables = page.extract_tables()
+                    for table in page_tables:
+                        if table and any(any(cell for cell in row) for row in table):
+                            # Clean empty cells and normalize
+                            cleaned_table = [
+                                [str(cell).strip() if cell else '' for cell in row]
+                                for row in table
+                            ]
+                            tables.append(cleaned_table)
+        except Exception as e:
+            print(f"pdfplumber extraction failed: {str(e)}", file=sys.stderr)
+        return tables
+
+    def _extract_with_layoutlm(self, pdf_path: str) -> List[List[List[str]]]:
+        """Extract tables using LayoutLM - good for complex layouts"""
+        if not HAS_LAYOUTLM:
             return []
             
-        # Clean cells and get column widths
-        cleaned_table = []
-        col_widths = [0] * len(table[0])
-        
-        for row in table:
-            cleaned_row = []
-            for i, cell in enumerate(row):
-                cleaned_cell = str(cell).strip() if cell else ''
-                cleaned_row.append(cleaned_cell)
-                if i < len(col_widths):
-                    col_widths[i] = max(col_widths[i], len(cleaned_cell))
-            cleaned_table.append(cleaned_row)
-        
-        # Generate markdown table
-        md_table = []
-        
-        # Header row
-        header = cleaned_table[0]
-        md_table.append("|" + "|".join(header) + "|")
-        
-        # Separator row
-        md_table.append("|" + "|".join("---" for _ in header) + "|")
-        
-        # Data rows
-        for row in cleaned_table[1:]:
-            md_table.append("|" + "|".join(row) + "|")
-        
-        md_table.append("")
-        return md_table
-
-
-class DocxConverter(HtmlConverter):
-    """
-    Converts DOCX files to Markdown. Style information (e.g.m headings) and tables are preserved where possible.
-    """
-
-    def convert(self, local_path, **kwargs) -> Union[None, DocumentConverterResult]:
-        # Bail if not a DOCX
-        extension = kwargs.get("file_extension", "")
-        if extension.lower() != ".docx":
-            return None
-
-        print(f"DocxConverter: Converting {local_path}", file=sys.stderr)
-        result = None
         try:
-            with open(local_path, "rb") as docx_file:
-                print("DocxConverter: Converting to HTML...", file=sys.stderr)
-                result = mammoth.convert_to_html(docx_file)
-                html_content = result.value
-                print(f"DocxConverter: HTML content length: {len(html_content)}", file=sys.stderr)
-                if result.messages:
-                    print("DocxConverter: Messages from mammoth:", file=sys.stderr)
-                    for message in result.messages:
-                        print(f"  {message}", file=sys.stderr)
-                result = self._convert(html_content)
-                if result:
-                    print(f"DocxConverter: Markdown content length: {len(result.text_content)}", file=sys.stderr)
-                return result
-        except Exception as e:
-            print(f"DocxConverter: Error during conversion: {str(e)}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-            raise
-
-
-class XlsxConverter(HtmlConverter):
-    """
-    Converts XLSX files to Markdown, with each sheet presented as a separate Markdown table.
-    """
-
-    def convert(self, local_path, **kwargs) -> Union[None, DocumentConverterResult]:
-        # Bail if not a XLSX
-        extension = kwargs.get("file_extension", "")
-        if extension.lower() != ".xlsx":
-            return None
-
-        sheets = pd.read_excel(local_path, sheet_name=None)
-        md_content = ""
-        for s in sheets:
-            md_content += f"## {s}\n"
-            html_content = sheets[s].to_html(index=False)
-            md_content += self._convert(html_content).text_content.strip() + "\n\n"
-
-        return DocumentConverterResult(
-            title=None,
-            text_content=md_content.strip(),
-        )
-
-
-class PptxConverter(HtmlConverter):
-    """
-    Converts PPTX files to Markdown. Supports heading, tables and images with alt text.
-    """
-
-    def convert(self, local_path, **kwargs) -> Union[None, DocumentConverterResult]:
-        # Bail if not a PPTX
-        extension = kwargs.get("file_extension", "")
-        if extension.lower() != ".pptx":
-            return None
-
-        md_content = ""
-
-        presentation = pptx.Presentation(local_path)
-        slide_num = 0
-        for slide in presentation.slides:
-            slide_num += 1
-
-            md_content += f"\n\n<!-- Slide number: {slide_num} -->\n"
-
-            title = slide.shapes.title
-            for shape in slide.shapes:
-                # Pictures
-                if self._is_picture(shape):
-                    # https://github.com/scanny/python-pptx/pull/512#issuecomment-1713100069
-                    alt_text = ""
-                    try:
-                        alt_text = shape._element._nvXxPr.cNvPr.attrib.get("descr", "")
-                    except Exception:
-                        pass
-
-                    # A placeholder name
-                    filename = re.sub(r"\W", "", shape.name) + ".jpg"
-                    md_content += (
-                        "\n!["
-                        + (alt_text if alt_text else shape.name)
-                        + "]("
-                        + filename
-                        + ")\n"
-                    )
-
-                # Tables
-                if self._is_table(shape):
-                    html_table = "<html><body><table>"
-                    first_row = True
-                    for row in shape.table.rows:
-                        html_table += "<tr>"
-                        for cell in row.cells:
-                            if first_row:
-                                html_table += "<th>" + html.escape(cell.text) + "</th>"
-                            else:
-                                html_table += "<td>" + html.escape(cell.text) + "</td>"
-                        html_table += "</tr>"
-                        first_row = False
-                    html_table += "</table></body></html>"
-                    md_content += (
-                        "\n" + self._convert(html_table).text_content.strip() + "\n"
-                    )
-
-                # Text areas
-                elif shape.has_text_frame:
-                    if shape == title:
-                        md_content += "# " + shape.text.lstrip() + "\n"
-                    else:
-                        md_content += shape.text + "\n"
-
-            md_content = md_content.strip()
-
-            if slide.has_notes_slide:
-                md_content += "\n\n### Notes:\n"
-                notes_frame = slide.notes_slide.notes_text_frame
-                if notes_frame is not None:
-                    md_content += notes_frame.text
-                md_content = md_content.strip()
-
-        return DocumentConverterResult(
-            title=None,
-            text_content=md_content.strip(),
-        )
-
-    def _is_picture(self, shape):
-        if shape.shape_type == pptx.enum.shapes.MSO_SHAPE_TYPE.PICTURE:
-            return True
-        if shape.shape_type == pptx.enum.shapes.MSO_SHAPE_TYPE.PLACEHOLDER:
-            if hasattr(shape, "image"):
-                return True
-        return False
-
-    def _is_table(self, shape):
-        if shape.shape_type == pptx.enum.shapes.MSO_SHAPE_TYPE.TABLE:
-            return True
-        return False
-
-
-class MediaConverter(DocumentConverter):
-    """
-    Abstract class for multi-modal media (e.g., images and audio)
-    """
-
-    def _get_metadata(self, local_path):
-        exiftool = shutil.which("exiftool")
-        if not exiftool:
-            return None
-        else:
-            try:
-                result = subprocess.run(
-                    [exiftool, "-json", local_path], capture_output=True, text=True
-                ).stdout
-                return json.loads(result)[0]
-            except Exception:
-                return None
-
-
-class WavConverter(MediaConverter):
-    """
-    Converts WAV files to markdown via extraction of metadata (if `exiftool` is installed), and speech transcription (if `speech_recognition` is installed).
-    """
-
-    def convert(self, local_path, **kwargs) -> Union[None, DocumentConverterResult]:
-        # Bail if not a XLSX
-        extension = kwargs.get("file_extension", "")
-        if extension.lower() != ".wav":
-            return None
-
-        md_content = ""
-
-        # Add metadata
-        metadata = self._get_metadata(local_path)
-        if metadata:
-            for f in [
-                "Title",
-                "Artist",
-                "Author",
-                "Band",
-                "Album",
-                "Genre",
-                "Track",
-                "DateTimeOriginal",
-                "CreateDate",
-                "Duration",
-            ]:
-                if f in metadata:
-                    md_content += f"{f}: {metadata[f]}\n"
-
-        # Transcribe
-        if IS_AUDIO_TRANSCRIPTION_CAPABLE:
-            try:
-                transcript = self._transcribe_audio(local_path)
-                md_content += "\n\n### Audio Transcript:\n" + (
-                    "[No speech detected]" if transcript == "" else transcript
-                )
-            except Exception:
-                md_content += (
-                    "\n\n### Audio Transcript:\nError. Could not transcribe this audio."
-                )
-
-        return DocumentConverterResult(
-            title=None,
-            text_content=md_content.strip(),
-        )
-
-    def _transcribe_audio(self, local_path) -> str:
-        recognizer = sr.Recognizer()
-        with sr.AudioFile(local_path) as source:
-            audio = recognizer.record(source)
-            return recognizer.recognize_google(audio).strip()
-
-
-class Mp3Converter(WavConverter):
-    """
-    Converts MP3 files to markdown via extraction of metadata (if `exiftool` is installed), and speech transcription (if `speech_recognition` AND `pydub` are installed).
-    """
-
-    def convert(self, local_path, **kwargs) -> Union[None, DocumentConverterResult]:
-        # Bail if not a MP3
-        extension = kwargs.get("file_extension", "")
-        if extension.lower() != ".mp3":
-            return None
-
-        md_content = ""
-
-        # Add metadata
-        metadata = self._get_metadata(local_path)
-        if metadata:
-            for f in [
-                "Title",
-                "Artist",
-                "Author",
-                "Band",
-                "Album",
-                "Genre",
-                "Track",
-                "DateTimeOriginal",
-                "CreateDate",
-                "Duration",
-            ]:
-                if f in metadata:
-                    md_content += f"{f}: {metadata[f]}\n"
-
-        # Transcribe
-        if IS_AUDIO_TRANSCRIPTION_CAPABLE:
-            handle, temp_path = tempfile.mkstemp(suffix=".wav")
-            os.close(handle)
-            try:
-                sound = pydub.AudioSegment.from_mp3(local_path)
-                sound.export(temp_path, format="wav")
-
-                _args = dict()
-                _args.update(kwargs)
-                _args["file_extension"] = ".wav"
-
-                try:
-                    transcript = super()._transcribe_audio(temp_path).strip()
-                    md_content += "\n\n### Audio Transcript:\n" + (
-                        "[No speech detected]" if transcript == "" else transcript
-                    )
-                except Exception:
-                    md_content += "\n\n### Audio Transcript:\nError. Could not transcribe this audio."
-
-            finally:
-                os.unlink(temp_path)
-
-        # Return the result
-        return DocumentConverterResult(
-            title=None,
-            text_content=md_content.strip(),
-        )
-
-
-class ImageConverter(MediaConverter):
-    """
-    Converts images to markdown via extraction of metadata (if `exiftool` is installed), OCR (if `easyocr` is installed), and description via a multimodal LLM (if an mlm_client is configured).
-    """
-
-    def convert(self, local_path, **kwargs) -> Union[None, DocumentConverterResult]:
-        # Bail if not a XLSX
-        extension = kwargs.get("file_extension", "")
-        if extension.lower() not in [".jpg", ".jpeg", ".png"]:
-            return None
-
-        md_content = ""
-
-        # Add metadata
-        metadata = self._get_metadata(local_path)
-        if metadata:
-            for f in [
-                "ImageSize",
-                "Title",
-                "Caption",
-                "Description",
-                "Keywords",
-                "Artist",
-                "Author",
-                "DateTimeOriginal",
-                "CreateDate",
-                "GPSPosition",
-            ]:
-                if f in metadata:
-                    md_content += f"{f}: {metadata[f]}\n"
-
-        # Try describing the image with GPTV
-        mlm_client = kwargs.get("mlm_client")
-        mlm_model = kwargs.get("mlm_model")
-        if mlm_client is not None and mlm_model is not None:
-            md_content += (
-                "\n# Description:\n"
-                + self._get_mlm_description(
-                    local_path,
-                    extension,
-                    mlm_client,
-                    mlm_model,
-                    prompt=kwargs.get("mlm_prompt"),
-                ).strip()
-                + "\n"
-            )
-
-        return DocumentConverterResult(
-            title=None,
-            text_content=md_content,
-        )
-
-    def _get_mlm_description(self, local_path, extension, client, model, prompt=None):
-        if prompt is None or prompt.strip() == "":
-            prompt = "Write a detailed caption for this image."
-
-        sys.stderr.write(f"MLM Prompt:\n{prompt}\n")
-
-        data_uri = ""
-        with open(local_path, "rb") as image_file:
-            content_type, encoding = mimetypes.guess_type("_dummy" + extension)
-            if content_type is None:
-                content_type = "image/jpeg"
-            image_base64 = base64.b64encode(image_file.read()).decode("utf-8")
-            data_uri = f"data:{content_type};base64,{image_base64}"
-
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": data_uri,
-                        },
-                    },
-                ],
-            }
-        ]
-
-        response = client.chat.completions.create(model=model, messages=messages)
-        return response.choices[0].message.content
-
-
-class OutlookConverter(DocumentConverter):
-    """
-    Converts Microsoft Outlook MSG files to markdown, preserving email metadata, body content, and attachments.
-    Requires the extract-msg library.
-    """
-
-    def convert(self, local_path: str, **kwargs: Any) -> Union[None, DocumentConverterResult]:
-        # Bail if not an MSG file
-        extension = kwargs.get("file_extension", "")
-        if extension.lower() != ".msg" and not local_path.lower().endswith(".msg"):
-            return None
-
-        # Bail if extract-msg is not installed
-        if not IS_OUTLOOK_CAPABLE:
-            return None
-
-        try:
-            # Load the MSG file
-            msg = extract_msg.Message(local_path)
+            # Check for Poppler in common locations
+            poppler_paths = [
+                r"C:\Program Files\poppler\Library\bin",
+                r"C:\Program Files\poppler\bin",
+                os.path.join(os.environ.get("PROGRAMFILES", ""), "poppler", "Library", "bin"),
+                os.path.join(os.environ.get("PROGRAMFILES", ""), "poppler", "bin")
+            ]
             
-            # Build content as a list of lines
-            lines = []
-            
-            # Add title
-            lines.append(f"# Email: {msg.subject}")
-            lines.append("")
-            
-            # Add metadata
-            lines.append("## Metadata")
-            lines.append(f"- **From:** {msg.sender}")
-            lines.append(f"- **To:** {msg.to}")
-            if msg.cc:
-                lines.append(f"- **CC:** {msg.cc}")
-            lines.append(f"- **Date:** {msg.date}")
-            lines.append("")
-            
-            # Add body
-            lines.append("## Body")
-            
-            # Try to get body text, with fallbacks
-            body_text = None
-            try:
-                body_text = msg.body
-            except:
-                try:
-                    body_text = msg.rtfBody
-                except:
-                    if msg.htmlBody:
-                        try:
-                            html_converter = HtmlConverter()
-                            html_result = html_converter._convert(msg.htmlBody)
-                            if html_result:
-                                body_text = html_result.text_content
-                        except:
-                            pass
-            
-            # Add body text if we got it
-            if body_text:
-                # Convert bytes to string if needed
-                if isinstance(body_text, bytes):
-                    # Try different encodings in order
-                    encodings = ['utf-8', 'gb2312', 'gb18030', 'big5', 'windows-1252', 'latin-1']
-                    decoded = False
-                    for encoding in encodings:
-                        try:
-                            body_text = body_text.decode(encoding)
-                            decoded = True
-                            break
-                        except:
-                            continue
-                    
-                    if not decoded:
-                        # If all decodings fail, use latin-1 as a last resort
-                        body_text = body_text.decode('latin-1', errors='replace')
-                
-                # Split body text into lines and add them
-                body_lines = body_text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
-                lines.extend(body_lines)
+            # Add Poppler to PATH if found
+            for path in poppler_paths:
+                if os.path.exists(path):
+                    os.environ["PATH"] = path + os.pathsep + os.environ.get("PATH", "")
+                    break
             else:
-                lines.append("[Could not extract email body]")
+                print("Poppler not found in common locations", file=sys.stderr)
+                return []
             
-            lines.append("")
+            # Convert PDF pages to images
+            images = convert_from_path(pdf_path)
             
-            # List attachments
-            if msg.attachments:
-                lines.append("## Attachments")
-                for attachment in msg.attachments:
-                    lines.append(f"- {attachment.longFilename}")
-                lines.append("")
-            
-            # Join with Windows line endings
-            return DocumentConverterResult(
-                title=msg.subject,
-                text_content='\r\n'.join(lines)
-            )
-            
-        except Exception as e:
-            print(f"Warning: Error converting {local_path}: {str(e)}", file=sys.stderr)
-            return None
-
-    def batch_convert_folder(
-        self, 
-        input_folder: str, 
-        output_folder: str, 
-        file_pattern: str = "*.msg",
-        skip_existing: bool = True
-    ) -> Dict[str, Union[str, Exception]]:
-        """
-        Convert all files matching the pattern in the input folder to markdown files in the output folder.
-        """
-        import glob
-        from pathlib import Path
-
-        # Create output folder if it doesn't exist
-        os.makedirs(output_folder, exist_ok=True)
-        
-        # Track results
-        results = {}
-        total_files = 0
-        success_count = 0
-        skip_count = 0
-        error_count = 0
-        
-        # Process each file
-        for input_path in glob.glob(os.path.join(input_folder, file_pattern)):
-            total_files += 1
-            input_filename = os.path.basename(input_path)
-            output_filename = os.path.splitext(input_filename)[0] + ".md"
-            output_path = os.path.join(output_folder, output_filename)
-            
-            # Skip if output exists and skip_existing is True
-            if skip_existing and os.path.exists(output_path):
-                results[input_filename] = "skipped - already exists"
-                skip_count += 1
-                continue
-                
-            try:
-                # Convert the file
-                result = self.convert(input_path)
-                
-                # Write the file with Windows line endings
-                with open(output_path, 'w', encoding='utf-8', newline='\r\n') as f:
-                    f.write(result.text_content)
-                
-                success_count += 1
-                results[input_filename] = "success"
-                print(f"Successfully converted: {input_filename}", file=sys.stderr)
-                
-            except:
-                error_count += 1
-                results[input_filename] = "error: conversion failed"
-                print(f"Skipping {input_filename} - conversion failed", file=sys.stderr)
-                continue
-        
-        # Print summary
-        print(f"\nConversion Summary:", file=sys.stderr)
-        print(f"Total files: {total_files}", file=sys.stderr)
-        print(f"Successfully converted: {success_count}", file=sys.stderr)
-        print(f"Skipped (already exist): {skip_count}", file=sys.stderr)
-        print(f"Failed: {error_count}", file=sys.stderr)
-                
-        return results
-
-
-class FileConversionException(BaseException):
-    pass
-
-
-class UnsupportedFormatException(BaseException):
-    pass
-
-
-class MarkItDown:
-    """(In preview) An extremely simple text-based document reader, suitable for LLM use.
-    This reader will convert common file-types or webpages to Markdown."""
-
-    def __init__(
-        self,
-        requests_session: Optional[requests.Session] = None,
-        mlm_client: Optional[Any] = None,
-        mlm_model: Optional[Any] = None,
-    ):
-        if requests_session is None:
-            self._requests_session = requests.Session()
-        else:
-            self._requests_session = requests_session
-
-        self._mlm_client = mlm_client
-        self._mlm_model = mlm_model
-
-        self._page_converters: List[DocumentConverter] = []
-
-        # Register converters for successful browsing operations
-        # Later registrations are tried first / take higher priority than earlier registrations
-        # To this end, the most specific converters should appear below the most generic converters
-        self.register_page_converter(PlainTextConverter())
-        self.register_page_converter(HtmlConverter())
-        self.register_page_converter(WikipediaConverter())
-        self.register_page_converter(YouTubeConverter())
-        self.register_page_converter(BingSerpConverter())
-        self.register_page_converter(DocxConverter())
-        self.register_page_converter(XlsxConverter())
-        self.register_page_converter(PptxConverter())
-        self.register_page_converter(WavConverter())
-        self.register_page_converter(Mp3Converter())
-        self.register_page_converter(ImageConverter())
-        self.register_page_converter(PdfConverter())
-        self.register_page_converter(OutlookConverter())
-
-    def convert(
-        self, source: Union[str, requests.Response], **kwargs: Any
-    ) -> DocumentConverterResult:  # TODO: deal with kwargs
-        """
-        Args:
-            - source: can be a string representing a path or url, or a requests.response object
-            - extension: specifies the file extension to use when interpreting the file. If None, infer from source (path, uri, content-type, etc.)
-        """
-
-        # Local path or url
-        if isinstance(source, str):
-            if (
-                source.startswith("http://")
-                or source.startswith("https://")
-                or source.startswith("file://")
-            ):
-                return self.convert_url(source, **kwargs)
-            else:
-                return self.convert_local(source, **kwargs)
-        # Request response
-        elif isinstance(source, requests.Response):
-            return self.convert_response(source, **kwargs)
-
-    def convert_local(
-        self, path: str, **kwargs: Any
-    ) -> DocumentConverterResult:  # TODO: deal with kwargs
-        # Prepare a list of extensions to try (in order of priority)
-        ext = kwargs.get("file_extension")
-        extensions = [ext] if ext is not None else []
-
-        # Get extension alternatives from the path and puremagic
-        base, ext = os.path.splitext(path)
-        self._append_ext(extensions, ext)
-
-        for g in self._guess_ext_magic(path):
-            self._append_ext(extensions, g)
-
-        # Convert
-        return self._convert(path, extensions, **kwargs)
-
-    # TODO what should stream's type be?
-    def convert_stream(
-        self, stream: Any, **kwargs: Any
-    ) -> DocumentConverterResult:  # TODO: deal with kwargs
-        # Prepare a list of extensions to try (in order of priority)
-        ext = kwargs.get("file_extension")
-        extensions = [ext] if ext is not None else []
-
-        # Save the file locally to a temporary file. It will be deleted before this method exits
-        handle, temp_path = tempfile.mkstemp()
-        fh = os.fdopen(handle, "wb")
-        result = None
-        try:
-            # Write to the temporary file
-            content = stream.read()
-            if isinstance(content, str):
-                fh.write(content.encode("utf-8"))
-            else:
-                fh.write(content)
-            fh.close()
-
-            # Use puremagic to check for more extension options
-            for g in self._guess_ext_magic(temp_path):
-                self._append_ext(extensions, g)
-
-            # Convert
-            result = self._convert(temp_path, extensions, **kwargs)
-        # Clean up
-        finally:
-            try:
-                fh.close()
-            except Exception:
+            for image in images:
+                # Process with LayoutLM
+                # This is a placeholder - implement actual LayoutLM processing
                 pass
-            os.unlink(temp_path)
-
-        return result
-
-    def convert_url(
-        self, url: str, **kwargs: Any
-    ) -> DocumentConverterResult:  # TODO: fix kwargs type
-        # Send a HTTP request to the URL
-        response = self._requests_session.get(url, stream=True)
-        response.raise_for_status()
-        return self.convert_response(response, **kwargs)
-
-    def convert_response(
-        self, response: requests.Response, **kwargs: Any
-    ) -> DocumentConverterResult:  # TODO fix kwargs type
-        # Prepare a list of extensions to try (in order of priority)
-        ext = kwargs.get("file_extension")
-        extensions = [ext] if ext is not None else []
-
-        # Guess from the mimetype
-        content_type = response.headers.get("content-type", "").split(";")[0]
-        self._append_ext(extensions, mimetypes.guess_extension(content_type))
-
-        # Read the content disposition if there is one
-        content_disposition = response.headers.get("content-disposition", "")
-        m = re.search(r"filename=([^;]+)", content_disposition)
-        if m:
-            base, ext = os.path.splitext(m.group(1).strip("\"'"))
-            self._append_ext(extensions, ext)
-
-        # Read from the extension from the path
-        base, ext = os.path.splitext(urlparse(response.url).path)
-        self._append_ext(extensions, ext)
-
-        # Save the file locally to a temporary file. It will be deleted before this method exits
-        handle, temp_path = tempfile.mkstemp()
-        fh = os.fdopen(handle, "wb")
-        result = None
-        try:
-            # Download the file
-            for chunk in response.iter_content(chunk_size=512):
-                fh.write(chunk)
-            fh.close()
-
-            # Use puremagic to check for more extension options
-            for g in self._guess_ext_magic(temp_path):
-                self._append_ext(extensions, g)
-
-            # Convert
-            result = self._convert(temp_path, extensions, url=response.url)
-        # Clean up
-        finally:
-            try:
-                fh.close()
-            except Exception:
-                pass
-            os.unlink(temp_path)
-
-        return result
-
-    def _convert(
-        self, local_path: str, extensions: List[Union[str, None]], **kwargs
-    ) -> DocumentConverterResult:
-        error_trace = ""
-        for ext in extensions + [None]:  # Try last with no extension
-            for converter in self._page_converters:
-                _kwargs = copy.deepcopy(kwargs)
-
-                # Overwrite file_extension appropriately
-                if ext is None:
-                    if "file_extension" in _kwargs:
-                        del _kwargs["file_extension"]
-                else:
-                    _kwargs.update({"file_extension": ext})
-
-                # Copy any additional global options
-                if "mlm_client" not in _kwargs and self._mlm_client is not None:
-                    _kwargs["mlm_client"] = self._mlm_client
-
-                if "mlm_model" not in _kwargs and self._mlm_model is not None:
-                    _kwargs["mlm_model"] = self._mlm_model
-
-                # If we hit an error log it and keep trying
-                try:
-                    res = converter.convert(local_path, **_kwargs)
-                    if res is not None:
-                        # Normalize the content
-                        res.text_content = "\n".join(
-                            [line.rstrip() for line in re.split(r"\r?\n", res.text_content)]
-                        )
-                        res.text_content = re.sub(r"\n{3,}", "\n\n", res.text_content)
-                        return res
-                except Exception:
-                    error_trace = ("\n\n" + traceback.format_exc()).strip()
-
-        # If we got this far without success, report any exceptions
-        if len(error_trace) > 0:
-            raise FileConversionException(
-                f"Could not convert '{local_path}' to Markdown. File type was recognized as {extensions}. While converting the file, the following error was encountered:\n\n{error_trace}"
-            )
-
-        # Nothing can handle it!
-        raise UnsupportedFormatException(
-            f"Could not convert '{local_path}' to Markdown. The formats {extensions} are not supported."
-        )
-
-    def _append_ext(self, extensions, ext):
-        """Append a unique non-None, non-empty extension to a list of extensions."""
-        if ext is None:
-            return
-        ext = ext.strip()
-        if ext == "":
-            return
-        # if ext not in extensions:
-        if True:
-            extensions.append(ext)
-
-    def _guess_ext_magic(self, path):
-        """Use puremagic (a Python implementation of libmagic) to guess a file's extension based on the first few bytes."""
-        # Use puremagic to guess
-        try:
-            guesses = puremagic.magic_file(path)
-            extensions = list()
-            for g in guesses:
-                ext = g.extension.strip()
-                if len(ext) > 0:
-                    if not ext.startswith("."):
-                        ext = "." + ext
-                    if ext not in extensions:
-                        extensions.append(ext)
-            return extensions
-        except FileNotFoundError:
-            pass
-        except IsADirectoryError:
-            pass
-        except PermissionError:
-            pass
+                
+        except Exception as e:
+            print(f"LayoutLM extraction failed: {str(e)}", file=sys.stderr)
         return []
 
-    def register_page_converter(self, converter: DocumentConverter) -> None:
-        """Register a page text converter."""
-        self._page_converters.insert(0, converter)
+    def _extract_with_heuristics(self, pdf_path: str) -> List[List[List[str]]]:
+        """Extract tables using text-based heuristics - fallback method"""
+        tables = []
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if text:
+                        # Use existing heuristic detection
+                        current_table = []
+                        for line in text.split('\n'):
+                            cells = self._detect_table_row(line)
+                            if cells:
+                                current_table.append(cells)
+                            elif current_table:
+                                if len(current_table) >= 2:
+                                    tables.append(current_table)
+                                current_table = []
+                        
+                        if current_table and len(current_table) >= 2:
+                            tables.append(current_table)
+        except Exception as e:
+            print(f"Heuristic extraction failed: {str(e)}", file=sys.stderr)
+        return tables
 
-    def batch_convert_folder(
-        self, 
-        input_folder: str, 
-        output_folder: str, 
-        file_pattern: str = "*.msg",
-        skip_existing: bool = True
-    ) -> Dict[str, Union[str, Exception]]:
-        """
-        Convert all files matching the pattern in the input folder to markdown files in the output folder.
-        """
-        import glob
-        from pathlib import Path
+    def _detect_table_row(self, line: str) -> Optional[List[str]]:
+        """Detect if a line contains table cells"""
+        # Check for common delimiters
+        delimiters = ["|", "\t", "    ", ";"]
+        for delimiter in delimiters:
+            if delimiter in line:
+                cells = [cell.strip() for cell in line.split(delimiter)]
+                if len(cells) >= 2 and all(cells):
+                    return cells
+        return None
 
-        # Create output folder if it doesn't exist
-        os.makedirs(output_folder, exist_ok=True)
+    def _calculate_table_confidence(self, table: List[List[str]]) -> float:
+        """Calculate confidence score for a table based on various metrics"""
+        if not table or not table[0]:
+            return 0.0
+
+        score = 0.0
+        num_rows = len(table)
+        num_cols = len(table[0])
         
-        # Track results
-        results = {}
-        total_files = 0
-        success_count = 0
-        skip_count = 0
-        error_count = 0
+        # Check for minimum size
+        if num_rows < 2 or num_cols < 2:
+            return 0.0
+
+        # Score based on consistency
+        col_lengths = [len(row) for row in table]
+        score += 0.3 if len(set(col_lengths)) == 1 else 0.0  # Consistent columns
         
-        # Process each file
-        for input_path in glob.glob(os.path.join(input_folder, file_pattern)):
-            total_files += 1
-            input_filename = os.path.basename(input_path)
-            output_filename = os.path.splitext(input_filename)[0] + ".md"
-            output_path = os.path.join(output_folder, output_filename)
+        # Score based on content
+        non_empty_cells = sum(1 for row in table for cell in row if cell.strip())
+        content_ratio = non_empty_cells / (num_rows * num_cols)
+        score += 0.3 * content_ratio
+        
+        # Score based on structure
+        has_header = any(cell.isupper() for cell in table[0])
+        score += 0.2 if has_header else 0.0
+        
+        return score
+
+    def _hash_table(self, table: List[List[str]]) -> str:
+        """Create a hash of table content to identify duplicates"""
+        return hash(str(table))
+
+    def _extract_with_gpt4v(self, pdf_path: str) -> List[List[List[str]]]:
+        """Extract tables using GPT-4V"""
+        if not self.llm_client:
+            print("OpenAI key not provided, skipping GPT-4V", file=sys.stderr)
+            return []
+        
+        try:
+            import openai
+            from PIL import Image
             
-            # Skip if output exists and skip_existing is True
-            if skip_existing and os.path.exists(output_path):
-                results[input_filename] = "skipped - already exists"
-                skip_count += 1
+            # Initialize cost tracking
+            total_tokens = 0
+            total_images = 0
+            estimated_cost = 0.0
+            
+            print("\nStarting GPT-4V table extraction...", file=sys.stderr)
+            images = convert_from_path(pdf_path)
+            all_tables = []
+            
+            # Process each page
+            total_pages = len(images)
+            for page_num, image in enumerate(images, 1):
+                print(f"\nPage {page_num}/{total_pages}:", file=sys.stderr)
+                
+                # Save temporary image
+                temp_path = f"{pdf_path}_temp_page_{page_num}.png"
+                image.save(temp_path)
+                
+                try:
+                    with open(temp_path, 'rb') as img_file:
+                        print("  Sending to OpenAI...", file=sys.stderr)
+                        
+                        # Create OpenAI client
+                        client = openai.OpenAI(api_key=self.llm_client)
+                        
+                        # Call GPT-4V with the exact prompt
+                        response = client.chat.completions.create(
+                            model="gpt-4-turbo-2024-04-09",
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": """You are an expert data extraction model. I will provide you with an image that may contain one or more tables. Your goal is to identify and extract **all** tables present in the image and format them according to the rules below.
+
+**What to return:**
+- A Python list of tables.
+- Each table is a list of rows.
+- Each row is a list of cell strings (text from each cell).
+
+**Detailed Requirements:**
+1. **Identify All Tables**:
+   - Scan the image for any tabular data (grids, rows, columns).
+   - Each detected table must be treated as a separate item in the overall Python list.
+   - Include any relevant headers above the table (e.g., "Schedule A", "Ineligible Items").
+   - Include any relevant footers or totals below the table.
+
+2. **Handle Rows and Cells**:
+   - For each table, preserve the logical order of rows (top to bottom) and cells (left to right).
+   - If you encounter merged cells (e.g., a cell that spans multiple rows or columns):
+     - **Option A**: Duplicate the merged cell's text in each cell's position if you can confidently parse it.
+     - **Option B**: Leave cells blank or put "N/A" if the correct content cannot be identified.
+   - For section headers (like "Schedule A"), create a row with empty cells except for the header text.
+   - For totals or summary rows, include them as regular rows at the bottom of the table.
+
+3. **Clean Up Text**:
+   - Remove any extraneous whitespace, line breaks, or non-table text.
+   - Keep section headers, subtotals, and grand totals that are part of the table structure.
+   - Preserve exact currency formatting (e.g., "$1,234.56").
+   - Maintain original number formatting (commas, decimals, etc.).
+
+4. **Edge Cases**:
+   - If a table is malformed or partially visible, extract only the recognizable cells.
+   - If no tables are found, return an empty list (e.g., `[]`).
+   - For split tables that are clearly one logical table, combine them.
+   - For tables with subtotals and grand totals, keep them with their parent table.
+
+5. **Strict Output Format**:
+   - Return only a **Python list** data structure with no additional explanatory text, comments, or markdown formatting.
+   - Do not wrap your result in quotes or backticks.
+   - Do not include any labels, headings, or bullet points. Just the raw Python list.
+
+Remember: 
+- Return only the list. 
+- Do not include the word "Answer:" or any markdown in your output.
+- If no tables are found, return `[]`."""
+                                },
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "image_url",
+                                            "image_url": {
+                                                "url": f"data:image/png;base64,{base64.b64encode(img_file.read()).decode()}"
+                                            }
+                                        }
+                                    ]
+                                }
+                            ],
+                            max_tokens=4096,
+                            temperature=0.1,
+                            response_format={"type": "text"}
+                        )
+                        
+                        # Track usage
+                        total_tokens += response.usage.total_tokens
+                        total_images += 1
+                        estimated_cost += (response.usage.total_tokens / 1000 * 0.01) + 0.00765
+                        
+                        # Parse the response
+                        try:
+                            response_text = response.choices[0].message.content.strip()
+                            print(f"  Raw response: {response_text[:200]}...", file=sys.stderr)
+                            
+                            # Evaluate the response as Python code
+                            tables_data = eval(response_text)
+                            
+                            # Validate and add tables
+                            if isinstance(tables_data, list):
+                                if tables_data and isinstance(tables_data[0], list):
+                                    if isinstance(tables_data[0][0], list):  # Multiple tables
+                                        for table in tables_data:
+                                            if len(table) > 1:  # At least headers and one row
+                                                all_tables.append(table)
+                                        print(f"  Found {len(tables_data)} tables", file=sys.stderr)
+                                    else:  # Single table
+                                        if len(tables_data) > 1:  # At least headers and one row
+                                            all_tables.append(tables_data)
+                                            print(f"  Found 1 table with {len(tables_data)} rows", file=sys.stderr)
+                                            
+                        except Exception as e:
+                            print(f"  Could not parse response: {str(e)}", file=sys.stderr)
+                        
+                finally:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+            
+            print(f"\nGPT-4V Processing Complete:", file=sys.stderr)
+            print(f"- Pages processed: {total_pages}", file=sys.stderr)
+            print(f"- Tables found: {len(all_tables)}", file=sys.stderr)
+            print(f"- Total cost: ${estimated_cost:.4f}", file=sys.stderr)
+            
+            return all_tables
+            
+        except Exception as e:
+            print(f"GPT-4V extraction failed: {str(e)}", file=sys.stderr)
+            return []
+
+    def _calculate_openai_cost(self, model: str, tokens: int, images: int = 0) -> float:
+        """Calculate OpenAI API cost"""
+        costs = {
+            "gpt-4-turbo-2024-04-09": {
+                "input": 0.01,   # per 1K tokens
+                "output": 0.03,  # per 1K tokens
+                "image": 0.00765  # per image
+            }
+        }
+        
+        if model not in costs:
+            return 0.0
+        
+        model_costs = costs[model]
+        token_cost = (tokens / 1000) * (model_costs["input"] + model_costs["output"])
+        image_cost = images * model_costs["image"]
+        
+        return token_cost + image_cost
+
+    def extract_with_gpt4v(self, image_path: str, extract_tables_only: bool = False) -> Union[List[List[List[str]]], Dict]:
+        """Extract content from an image using GPT-4V"""
+        if not self.llm_client:
+            print("OpenAI key not provided, skipping GPT-4V", file=sys.stderr)
+            return [] if extract_tables_only else {}
+        
+        try:
+            import openai
+            from PIL import Image
+            
+            print("  Sending to OpenAI...", file=sys.stderr)
+            
+            # Create OpenAI client
+            client = openai.OpenAI(api_key=self.llm_client)
+            
+            # Read and encode image
+            with open(image_path, 'rb') as img_file:
+                base64_image = base64.b64encode(img_file.read()).decode()
+            
+            # Use appropriate prompt based on mode
+            if extract_tables_only:
+                system_prompt = """You are an expert document parser specialized in extracting structured content from images. Extract ALL content from this image and format it as a JSON object.
+
+Format the response as:
+{
+    "text": "All text content from the image, excluding any content that appears in tables",
+    "tables": [
+        {
+            "title": null,
+            "data": [
+                ["Column1", "Column2", "Column3", "Column4", "Column5", "Column6"],  # Original header row
+                ["", "", "", "Category", "", ""],  # Category/section row with empty cells
+                ["Data", "Data", "Data", "Data", "Data", "Data"]  # Data row
+            ],
+            "structure": {
+                "header_rows": [0],
+                "section_rows": [
+                    {"index": 1, "text": "Category", "column": 3}  # Preserve exact text from document
+                ],
+                "total_rows": [],
+                "column_types": {
+                    "numeric": [],
+                    "text": [],
+                    "currency": []
+                }
+            }
+        }
+    ]
+}
+
+Critical Rules:
+1. NEVER generate, modify, or enhance any content
+2. NEVER add descriptive headers or labels
+3. NEVER change the text of section headers
+4. EXACTLY copy all text as it appears in the document
+5. For section/category rows (like "Schedule A" or "Ineligible Items"):
+   - Create a row with empty cells
+   - Place the EXACT text in its original column
+   - Keep all other cells empty
+6. Preserve original:
+   - Column headers
+   - Section names
+   - Numbers and currency formatting
+   - Cell content exactly as shown
+7. Do not combine or split cells
+8. Do not add explanatory text
+9. Do not reformat or standardize data
+"""
+                response_format = {"type": "json_object"}
+            else:
+                system_prompt = """You are an expert document parser specialized in extracting structured content from images. Extract ALL content from this image and format it as a JSON object.
+
+Format the response as:
+{
+    "text": "All text content from the image, excluding any content that appears in tables",
+    "tables": [
+        {
+            "title": null,
+            "data": [
+                ["Column1", "Column2", "Column3", "Column4", "Column5", "Column6"],  # Original header row
+                ["", "", "", "Category", "", ""],  # Category/section row with empty cells
+                ["Data", "Data", "Data", "Data", "Data", "Data"]  # Data row
+            ],
+            "structure": {
+                "header_rows": [0],
+                "section_rows": [
+                    {"index": 1, "text": "Category", "column": 3}  # Preserve exact text from document
+                ],
+                "total_rows": [],
+                "column_types": {
+                    "numeric": [],
+                    "text": [],
+                    "currency": []
+                }
+            }
+        }
+    ]
+}
+
+Critical Rules:
+1. NEVER generate, modify, or enhance any content
+2. NEVER add descriptive headers or labels
+3. NEVER change the text of section headers
+4. EXACTLY copy all text as it appears in the document
+5. For section/category rows (like "Schedule A" or "Ineligible Items"):
+   - Create a row with empty cells
+   - Place the EXACT text in its original column
+   - Keep all other cells empty
+6. Preserve original:
+   - Column headers
+   - Section names
+   - Numbers and currency formatting
+   - Cell content exactly as shown
+7. Do not combine or split cells
+8. Do not add explanatory text
+9. Do not reformat or standardize data
+"""
+                response_format = {"type": "json_object"}
+            
+            # Call GPT-4V with updated model name
+            model = "gpt-4-turbo-2024-04-09"
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": system_prompt
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Extract all content from this image, including both text and tables."
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{base64_image}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=4096,
+                temperature=0.1,
+                response_format=response_format
+            )
+            
+            # Calculate and log cost
+            self.last_cost = self._calculate_openai_cost(model, response.usage.total_tokens, images=1)
+            print(f"  Cost: ${self.last_cost:.4f} (Tokens: {response.usage.total_tokens}, Images: 1)", file=sys.stderr)
+            
+            # Parse response based on mode
+            if extract_tables_only:
+                try:
+                    content = response.choices[0].message.content.strip()
+                    # Clean up the response to ensure valid Python syntax
+                    content = content.replace("'", '"')  # Replace single quotes with double quotes
+                    content = re.sub(r'(\d),(\d)', r'\1\2', content)  # Remove commas in numbers
+                    content = re.sub(r'\$\s*(\d+)', r'$ \1', content)  # Format currency consistently
+                    
+                    # Safely evaluate the string as Python code
+                    tables_data = ast.literal_eval(content)
+                    
+                    if not isinstance(tables_data, list):
+                        print("  Warning: Response was not a list", file=sys.stderr)
+                        return []
+                        
+                    # Validate table structure
+                    valid_tables = []
+                    for table in tables_data:
+                        if isinstance(table, list) and all(isinstance(row, list) for row in table):
+                            # Convert all values to strings
+                            valid_table = [[str(cell).strip() for cell in row] for row in table]
+                            valid_tables.append(valid_table)
+                    
+                    return valid_tables
+                    
+                except Exception as e:
+                    print(f"  Could not parse tables: {str(e)}", file=sys.stderr)
+                    print(f"  Raw response: {content[:200]}...", file=sys.stderr)
+                    return []
+            else:
+                try:
+                    data = json.loads(response.choices[0].message.content)
+                    markdown_content = []
+                    
+                    if data.get("text"):
+                        text = data["text"].strip()
+                        if text:
+                            markdown_content.append(text + "\n")
+                    
+                    # Use class-level seen_tables
+                    for table in data.get("tables", []):
+                        table_data = table.get("data", [])
+                        table_hash = hash(str(table_data))
+                        
+                        if table_hash not in self.seen_tables:
+                            self.seen_tables.add(table_hash)
+                            
+                            if table.get("title"):
+                                markdown_content.append(f"\n### {table['title']}\n")
+                            
+                            if table_data:
+                                # Format table with section headers
+                                table_md = self._format_table(table_data, structure=table.get("structure", {}))
+                                markdown_content.extend(table_md)
+                                markdown_content.append("\n")
+                    
+                    return {
+                        "text": "\n".join(markdown_content),
+                        "tables": data.get("tables", [])
+                    }
+                    
+                except Exception as e:
+                    print(f"  Could not parse JSON: {str(e)}", file=sys.stderr)
+                    return {"text": "", "tables": []}
+                
+        except Exception as e:
+            print(f"GPT-4V extraction failed: {str(e)}", file=sys.stderr)
+            return [] if extract_tables_only else {"text": "", "tables": []}
+
+    def _format_table(self, table: List[List[str]], structure: Dict = None) -> List[str]:
+        """Format table with improved structure handling"""
+        if not table or not structure:
+            return []
+
+        # Clean and standardize table
+        cleaned_table = []
+        max_cols = max(len(row) for row in table)
+        
+        # Process header row first
+        header_row = table[0]
+        header_row = [str(cell).strip() for cell in header_row] + [''] * (max_cols - len(header_row))
+        cleaned_table.append(header_row)
+        
+        # Determine alignments based on column types
+        alignments = []
+        col_types = structure.get('column_types', {})
+        numeric_cols = set(col_types.get('numeric', []))
+        text_cols = set(col_types.get('text', []))
+        
+        for i in range(max_cols):
+            if i in numeric_cols:
+                alignments.append('---:')  # Right align
+            elif i in text_cols:
+                alignments.append(':---')  # Left align
+            else:
+                alignments.append(':---:')  # Center align
+        
+        # Format markdown table
+        markdown_lines = []
+        markdown_lines.append('| ' + ' | '.join(header_row) + ' |')
+        markdown_lines.append('|' + '|'.join(alignments) + '|')
+        
+        # Process data rows with special handling for section headers
+        section_headers = {row['row']: (row['text'], row['column']) 
+                          for row in structure.get('section_headers', [])}
+        
+        for row_idx, row in enumerate(table[1:], 1):
+            if row_idx in section_headers:
+                # Create section header row
+                text, col = section_headers[row_idx]
+                cells = [''] * max_cols
+                cells[col] = f"**{text}**"
+                markdown_lines.append('| ' + ' | '.join(cells) + ' |')
+            else:
+                # Regular data row
+                cells = [str(cell).strip() for cell in row] + [''] * (max_cols - len(row))
+                markdown_lines.append('| ' + ' | '.join(cells) + ' |')
+        
+        return markdown_lines
+
+    def _post_process_table(self, markdown_lines: List[str], num_columns: int) -> List[str]:
+        """Post-process table to fix special rows and formatting"""
+        fixed_lines = []
+        header_pattern = re.compile(r'^\s*(Schedule [A-Z]|Ineligible Items|Total|Subtotal|Grand Total)\s*$', re.IGNORECASE)
+        
+        for line in markdown_lines:
+            # Skip alignment row
+            if line.count('---') > 0:
+                fixed_lines.append(line)
                 continue
                 
+            # Extract cells
+            cells = [cell.strip() for cell in line.strip('|').split('|')]
+            
+            # Check if any cell matches header pattern
+            for i, cell in enumerate(cells):
+                if header_pattern.match(cell):
+                    # Create new row with the header in a centered position
+                    new_cells = [''] * num_columns
+                    center_pos = num_columns // 2
+                    new_cells[center_pos] = f"**{cell}**"  # Make it bold
+                    line = '| ' + ' | '.join(new_cells) + ' |'
+                    break
+                    
+            # Handle currency formatting
+            cells = [cell.strip() for cell in line.strip('|').split('|')]
+            formatted_cells = []
+            for cell in cells:
+                # Standardize currency format
+                if re.match(r'^\$?\s*[\d,.]+$', cell.strip()):
+                    # Remove existing $ and spaces
+                    num = cell.replace('$', '').replace(' ', '')
+                    # Format with $ and proper spacing
+                    cell = f"$ {num}"
+                formatted_cells.append(cell)
+            
+            line = '| ' + ' | '.join(formatted_cells) + ' |'
+            fixed_lines.append(line)
+            
+        return fixed_lines
+
+    def _clean_table_text(self, text: str) -> str:
+        """Clean table text for better matching"""
+        if not text:
+            return ""
+            
+        # Remove extra whitespace
+        text = ' '.join(text.split())
+        
+        # Standardize currency formatting
+        text = re.sub(r'\$\s+', '$', text)
+        
+        # Keep thousands separators for readability
+        # text = re.sub(r'(?<=\d),(?=\d{3})', '', text)  # Removed this line
+        
+        # Standardize number formatting
+        text = re.sub(r'(?<=\d)\s+(?=\d)', '', text)  # Remove space between numbers
+        
+        # Clean up special characters
+        text = text.replace('–', '-')  # Standardize dashes
+        text = text.replace('—', '-')
+        
+        return text.strip()
+
+    def _validate_table(self, table: List[List[str]]) -> bool:
+        """Validate table structure and content"""
+        if not table or not table[0]:
+            return False
+        
+        try:
+            # Check row lengths are consistent
+            row_length = len(table[0])
+            if not all(len(row) == row_length for row in table):
+                return False
+            
+            # Check for minimum content
+            content_cells = sum(1 for row in table for cell in row if str(cell).strip())
+            if content_cells < (row_length * 2):  # At least header and one data row
+                return False
+            
+            # Check for reasonable cell content
+            for row in table:
+                for cell in row:
+                    cell_text = str(cell).strip()
+                    if cell_text and len(cell_text) > 1000:  # Cell too long
+                        return False
+                    
+                    # Check for invalid characters or patterns
+                    if any(char in cell_text for char in ['<', '>', '{', '}']):
+                        return False
+            
+            # Check for header-like first row
+            header_row = [str(cell).strip() for cell in table[0]]
+            if not any(header_row):  # Empty header
+                return False
+            
+            return True
+            
+        except Exception as e:
+            print(f"Table validation error: {str(e)}", file=sys.stderr)
+            return False
+
+class MarkItDown:
+    """Main class for converting documents to markdown."""
+    
+    def __init__(self, 
+                 llm_client=None, 
+                 llm_model=None,
+                 table_strategy: Union[TableExtractionStrategy, str] = TableExtractionStrategy.HEURISTIC):
+        self.llm_client = llm_client
+        self.llm_model = llm_model
+        self.pdf_table_extractor = PdfTableExtractor(llm_client=llm_client)
+        
+        # Set table extraction strategy
+        if isinstance(table_strategy, str):
+            table_strategy = TableExtractionStrategy(table_strategy.lower())
+        self.table_strategy = table_strategy
+        
+        # Initialize ML models if needed
+        self.layout_model = None
+        if table_strategy in [TableExtractionStrategy.LAYOUTLM, TableExtractionStrategy.AUTO]:
+            if HAS_LAYOUTLM:
+                self.layout_model = self._init_layoutlm()
+            else:
+                warnings.warn("LayoutLMv3 requested but not available")
+
+        # Add support for different file handlers
+        self.handlers = {
+            '.pdf': self._handle_pdf,
+            '.docx': self._handle_docx,
+            '.xlsx': self._handle_excel,
+            '.pptx': self._handle_powerpoint,
+            '.jpg': self._handle_image,
+            '.png': self._handle_image,
+            '.html': self._handle_html,
+            '.json': self._handle_json,
+            '.xml': self._handle_xml,
+            '.zip': self._handle_zip,
+            '.msg': self._handle_msg
+        }
+
+    def convert(self, file_path: str) -> ConversionResult:
+        """Convert with progress reporting"""
+        print(f"\nProcessing: {os.path.basename(file_path)}")
+        
+        try:
+            # Get file extension
+            ext = os.path.splitext(file_path)[1].lower()
+            print(f"File type: {ext}")
+            
+            # Get appropriate handler
+            handler = self.handlers.get(ext)
+            if not handler:
+                raise UnsupportedFormatException(f"Unsupported file type: {ext}")
+            
+            # Convert file
+            print("Converting...")
+            result = handler(file_path)
+            print("Conversion complete")
+            
+            # Save result
+            output_dir = result.get('output_dir') or os.path.join(os.path.dirname(file_path), "output")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            markdown_path = os.path.join(output_dir, os.path.splitext(os.path.basename(file_path))[0] + '.md')
+            with open(markdown_path, 'w', encoding='utf-8') as f:
+                f.write(result['text'])
+            print(f"Saved to: {markdown_path}")
+            
+            return ConversionResult(
+                text_content=result['text'],
+                metadata=result.get('metadata', {}),
+                images=result.get('images', [])
+            )
+            
+        except Exception as e:
+            print(f"Error: {str(e)}")
+            raise FileConversionException(f"Error converting {file_path}: {str(e)}")
+
+    def convert_batch(self, input_dir: str, output_dir: str) -> Dict[str, Any]:
+        """Convert all files in a directory with progress bar"""
+        try:
+            from tqdm import tqdm
+        except ImportError:
+            print("For progress bars, install tqdm: pip install tqdm")
+            tqdm = lambda x: x  # Fallback if tqdm not installed
+        
+        results = {
+            'successful': [],
+            'failed': [],
+            'skipped': []
+        }
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Get list of all files first
+        all_files = []
+        for root, _, files in os.walk(input_dir):
+            for filename in files:
+                all_files.append((root, filename))
+        
+        # Process files with progress bar
+        for root, filename in tqdm(all_files, desc="Converting files", unit="file"):
+            input_path = os.path.join(root, filename)
+            
+            # Create relative path for output
+            rel_path = os.path.relpath(input_path, input_dir)
+            output_path = os.path.join(output_dir, rel_path)
+            output_path = os.path.splitext(output_path)[0] + '.md'
+            
             try:
-                # Convert the file
+                # Convert file
                 result = self.convert(input_path)
                 
-                # Write the file with Windows line endings
-                with open(output_path, 'w', encoding='utf-8', newline='\r\n') as f:
+                # Create output directory if needed
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                
+                # Write markdown output
+                with open(output_path, 'w', encoding='utf-8') as f:
                     f.write(result.text_content)
                 
-                success_count += 1
-                results[input_filename] = "success"
-                print(f"Successfully converted: {input_filename}", file=sys.stderr)
+                results['successful'].append({
+                    'input': input_path,
+                    'output': output_path,
+                    'metadata': result.metadata,
+                    'images': result.images
+                })
                 
-            except:
-                error_count += 1
-                results[input_filename] = "error: conversion failed"
-                print(f"Skipping {input_filename} - conversion failed", file=sys.stderr)
-                continue
-        
-        # Print summary
-        print(f"\nConversion Summary:", file=sys.stderr)
-        print(f"Total files: {total_files}", file=sys.stderr)
-        print(f"Successfully converted: {success_count}", file=sys.stderr)
-        print(f"Skipped (already exist): {skip_count}", file=sys.stderr)
-        print(f"Failed: {error_count}", file=sys.stderr)
+            except UnsupportedFormatException:
+                results['skipped'].append({
+                    'input': input_path,
+                    'reason': 'Unsupported file type'
+                })
+            except Exception as e:
+                results['failed'].append({
+                    'input': input_path,
+                    'error': str(e)
+                })
                 
         return results
 
-
-if __name__ == "__main__":
-    import sys
-    import os
-    
-    if len(sys.argv) > 1:
-        input_path = sys.argv[1]
-        # Create output directory next to input directory
-        output_path = os.path.join(os.path.dirname(input_path), "output")
-        os.makedirs(output_path, exist_ok=True)
-        
-        converter = MarkItDown()
-        
-        if os.path.isdir(input_path):
-            print(f"Processing directory: {input_path}")
-            for filename in os.listdir(input_path):
-                file_path = os.path.join(input_path, filename)
-                if os.path.isfile(file_path):
-                    try:
-                        print(f"Converting file: {filename}")
-                        result = converter.convert(file_path)
-                        
-                        # Create markdown filename
-                        md_filename = os.path.splitext(filename)[0] + ".md"
-                        output_file = os.path.join(output_path, md_filename)
-                        
-                        # Save to markdown file
-                        with open(output_file, 'w', encoding='utf-8') as f:
-                            f.write(result.text_content)
-                            
-                        print(f"Saved to: {output_file}")
-                        print("-" * 50)
-                    except Exception as e:
-                        print(f"Error processing {filename}: {e}")
-        else:
-            try:
-                result = converter.convert(input_path)
-                filename = os.path.basename(input_path)
-                md_filename = os.path.splitext(filename)[0] + ".md"
-                output_file = os.path.join(output_path, md_filename)
+    def _handle_pdf(self, file_path: str) -> Dict[str, Any]:
+        """Handle PDF conversion with both text and table extraction"""
+        try:
+            # Setup directories
+            base_dir = os.path.dirname(file_path)
+            output_dir = os.path.join(base_dir, "output")
+            images_dir = os.path.join(output_dir, "images")
+            os.makedirs(images_dir, exist_ok=True)
+            
+            # Reset table extractor state
+            self.pdf_table_extractor.reset_state()
+            
+            with pdfplumber.open(file_path) as pdf:
+                text_content = []
+                images = []
                 
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    f.write(result.text_content)
+                # Extract content page by page
+                print("\nExtracting content...", file=sys.stderr)
+                for page_num, page in enumerate(pdf.pages, 1):
+                    text_content.append(f"\n## Page {page_num}\n\n")
                     
-                print(f"Saved to: {output_file}")
-            except Exception as e:
-                print(f"Error processing {input_path}: {e}")
-    else:
-        print("Please provide an input path")
+                    # Convert page to image for GPT-4V
+                    images_from_path = convert_from_path(file_path, first_page=page_num, last_page=page_num)
+                    if images_from_path:
+                        img_path = os.path.join(images_dir, f"page_{page_num}.png")
+                        images_from_path[0].save(img_path)
+                        images.append(img_path)
+                        
+                        if self.llm_client:  # Use GPT-4V if available
+                            gpt4v_result = self.pdf_table_extractor.extract_with_gpt4v(img_path, extract_tables_only=False)
+                            if gpt4v_result and isinstance(gpt4v_result, dict):
+                                # Add extracted text
+                                if gpt4v_result.get("text"):
+                                    text_content.append(gpt4v_result["text"] + "\n\n")
+                                
+                                # Add tables
+                                for table in gpt4v_result.get("tables", []):
+                                    table_data = table.get("data", [])
+                                    table_hash = hash(str(table_data))
+                                    
+                                    if table_hash not in self.pdf_table_extractor.seen_tables:
+                                        self.pdf_table_extractor.seen_tables.add(table_hash)
+                                        if table.get("title"):
+                                            text_content.append(f"\n### {table['title']}\n")
+                                        if table_data:
+                                            table_md = self.pdf_table_extractor._format_table(table_data)
+                                            if table_md:
+                                                text_content.extend(table_md)
+                                                text_content.append("\n")
+                            else:  # Use traditional methods if GPT-4V not available
+                                page_text = page.extract_text()
+                                if not page_text:
+                                    page_text = self._extract_text_with_ocr(page, file_path, page_num)
+                                if page_text:
+                                    text_content.append(page_text + "\n\n")
+                                
+                                # Extract tables using default method
+                                tables = self.pdf_table_extractor.extract_tables(file_path)
+                                for table in tables:
+                                    if self._table_belongs_to_page(table, page_text):
+                                        table_md = self.pdf_table_extractor._format_table(table)
+                                        if table_md:
+                                            text_content.extend(table_md)
+                                            text_content.append("\n")
+                    
+                    # Add image reference
+                    rel_img_path = os.path.relpath(img_path, output_dir).replace('\\', '/')
+                    text_content.append(f"\n![Page {page_num}]({rel_img_path})\n")
+                
+                # Add file identifier at the end
+                text_content.append(f"\n{os.path.splitext(os.path.basename(file_path))[0]}\n")
+                
+                return {
+                    'text': '\n'.join(text_content),
+                    'images': images,
+                    'output_dir': output_dir
+                }
+                
+        except Exception as e:
+            print(f"Error processing PDF {os.path.basename(file_path)}: {str(e)}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            return {
+                'text': f"Error processing file: {str(e)}",
+                'images': [],
+                'output_dir': os.path.join(os.path.dirname(file_path), "output")
+            }
+
+    def _handle_docx(self, file_path: str) -> Dict[str, Any]:
+        """Handle DOCX conversion"""
+        try:
+            # Create output directory structure
+            base_dir = os.path.dirname(file_path)
+            output_dir = os.path.join(base_dir, "output")
+            images_dir = os.path.join(output_dir, "images")
+            os.makedirs(images_dir, exist_ok=True)
+            
+            # Convert docx to html
+            with open(file_path, 'rb') as docx_file:
+                result = mammoth.convert_to_html(docx_file)
+            
+            # Extract and save images
+            images = []
+            for message in result.messages:
+                if message.type == "image":
+                    try:
+                        base_name = os.path.splitext(os.path.basename(file_path))[0]
+                        img_path = os.path.join(images_dir, f"{base_name}_image_{len(images)}.png")
+                        with open(img_path, 'wb') as f:
+                            f.write(message.value)
+                        images.append(img_path)
+                    except Exception as e:
+                        print(f"Warning: Could not save image: {e}", file=sys.stderr)
+            
+            # Convert HTML to markdown
+            markdown = markdownify.markdownify(result.value, heading_style="ATX")
+            
+            return {
+                'text': markdown,
+                'metadata': {'image_count': len(images)},
+                'images': images,
+                'output_dir': output_dir
+            }
+            
+        except Exception as e:
+            raise FileConversionException(f"Error converting DOCX: {str(e)}")
+
+    def _extract_text_with_ocr(self, page, file_path: str, page_num: int) -> str:
+        """Extract text from a page using OCR"""
+        try:
+            # Convert page to image for OCR
+            images_from_path = convert_from_path(file_path, first_page=page_num, last_page=page_num)
+            if not images_from_path:
+                return ""
+            
+            # Save temporary image
+            temp_path = f"{file_path}_temp_page_{page_num}.png"
+            images_from_path[0].save(temp_path)
+            
+            try:
+                # Perform OCR
+                text = self._perform_ocr(temp_path)
+                if text:
+                    print(f"  OCR successful for page {page_num}", file=sys.stderr)
+                    return text
+                else:
+                    print(f"  No text found by OCR on page {page_num}", file=sys.stderr)
+                    return ""
+                
+            finally:
+                # Clean up temp file
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                
+        except Exception as e:
+            print(f"Warning: OCR failed for page {page_num}: {e}", file=sys.stderr)
+            return ""
+
+    def _perform_ocr(self, image_path: str) -> str:
+        """Perform OCR on an image"""
+        try:
+            import pytesseract
+            from PIL import Image
+            
+            # Set explicit Tesseract path for Windows
+            if sys.platform == "win32":
+                pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+            
+            # Perform OCR
+            image = Image.open(image_path)
+            text = pytesseract.image_to_string(image)
+            return text.strip()
+            
+        except Exception as e:
+            print(f"Warning: OCR failed: {str(e)}", file=sys.stderr)
+            return ""
+
+    def _table_belongs_to_page(self, table: List[List[str]], page_text: str) -> bool:
+        """Check if a table belongs to the current page"""
+        if not table or not page_text:
+            return False
+            
+        # Convert table to text for comparison
+        table_text = ' '.join(' '.join(str(cell) for cell in row) for row in table)
+        
+        # Look for significant matches
+        header_row = table[0] if table else []
+        data_row = table[1] if len(table) > 1 else []
+        
+        # Check if header or first data row appears in page
+        header_match = all(str(cell) in page_text for cell in header_row if cell)
+        data_match = all(str(cell) in page_text for cell in data_row if cell)
+        
+        return header_match or data_match
+
+    # Add stubs for other handlers
+    def _handle_excel(self, file_path: str) -> Dict[str, Any]:
+        raise NotImplementedError("Excel handling not implemented yet")
+
+    def _handle_powerpoint(self, file_path: str) -> Dict[str, Any]:
+        raise NotImplementedError("PowerPoint handling not implemented yet")
+
+    def _handle_image(self, file_path: str) -> Dict[str, Any]:
+        raise NotImplementedError("Image handling not implemented yet")
+
+    def _handle_html(self, file_path: str) -> Dict[str, Any]:
+        raise NotImplementedError("HTML handling not implemented yet")
+
+    def _handle_json(self, file_path: str) -> Dict[str, Any]:
+        raise NotImplementedError("JSON handling not implemented yet")
+
+    def _handle_xml(self, file_path: str) -> Dict[str, Any]:
+        raise NotImplementedError("XML handling not implemented yet")
+
+    def _handle_zip(self, file_path: str) -> Dict[str, Any]:
+        raise NotImplementedError("ZIP handling not implemented yet")
+
+    def _handle_msg(self, file_path: str) -> Dict[str, Any]:
+        raise NotImplementedError("MSG handling not implemented yet")
