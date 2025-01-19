@@ -760,6 +760,58 @@ class MarkItDown:
         
         # 1. Try pdfplumber text and table detection first
         page_text = page.extract_text() or ""
+        
+        # Format the text content with better spacing and structure
+        if page_text:
+            # Split into paragraphs and process each
+            paragraphs = [p.strip() for p in page_text.split('\n\n') if p.strip()]
+            formatted_text = []
+            
+            in_list = False  # Track if we're in a list
+            for para in paragraphs:
+                # Clean up the paragraph
+                para = para.replace('\r', '').strip()
+                
+                # Skip empty paragraphs
+                if not para:
+                    continue
+                    
+                # Check for different text types
+                if para.isupper() and len(para) < 100 and len(para.split()) < 8:
+                    # Section heading - convert to title case
+                    if formatted_text:  # Add extra spacing before new section
+                        formatted_text.append('')
+                    formatted_text.append(f"### {para.title()}")
+                    formatted_text.append('')
+                    in_list = False
+                
+                elif any(para.lstrip().startswith(marker) for marker in ('•', '-', '*', '1.', '2.', '3.')):
+                    # List item
+                    if not in_list:  # Add spacing before list starts
+                        formatted_text.append('')
+                    # Clean up and standardize list markers
+                    list_item = para.lstrip('•-* \t')
+                    formatted_text.append(f"- {list_item}")
+                    in_list = True
+                
+                elif ':' in para and len(para.split(':')[0]) < 30:
+                    # Definition or label
+                    label, content = para.split(':', 1)
+                    formatted_text.append(f"**{label.strip()}**: {content.strip()}")
+                    formatted_text.append('')
+                    in_list = False
+                
+                else:
+                    # Regular paragraph
+                    if in_list:  # Add spacing after list ends
+                        formatted_text.append('')
+                    formatted_text.append(para)
+                    formatted_text.append('')
+                    in_list = False
+
+            # Join all formatted text
+            page_text = '\n'.join(formatted_text)
+
         pdf_tables = page.extract_tables()
         has_tables = bool(pdf_tables and any(t for t in pdf_tables if t and len(t) > 1))
         
@@ -802,28 +854,39 @@ class MarkItDown:
                             if not rows or not any(row for row in rows if any(cell for cell in row)):  # Skip empty tables
                                 continue
                             
-                            table_md.append('')  # Blank line before table
+                            table_md.append('\n')  # Extra spacing before table
                             
-                            # Add table title if present
+                            # Add table title if present with better formatting
                             title = table.get('title', '').strip()
                             if title:
-                                table_md.append(f"### {title}\n")
+                                table_md.append(f"### {title}")
+                                table_md.append('')  # Blank line after title
                             
-                            # Get max column count for proper alignment
+                            # Get max column count and widths for proper alignment
                             max_cols = max(len(row) for row in rows)
+                            col_widths = [0] * max_cols
+                            for row in rows:
+                                for i, cell in enumerate(row):
+                                    col_widths[i] = max(col_widths[i], len(str(cell)))
                             
-                            # Format each row
+                            # Format each row with proper spacing
                             for i, row in enumerate(rows):
                                 # Pad row to max columns if needed
                                 padded_row = row + [''] * (max_cols - len(row))
-                                table_md.append('| ' + ' | '.join(str(cell) for cell in padded_row) + ' |')
+                                # Add padding to each cell for better readability
+                                formatted_cells = [f" {str(cell):<{col_widths[j]}} " for j, cell in enumerate(padded_row)]
+                                table_md.append('|' + '|'.join(formatted_cells) + '|')
                                 
-                                # Add separator after header
+                                # Add separator after header with alignment
                                 if i == 0:
-                                    table_md.append('| ' + ' | '.join(['---'] * max_cols) + ' |')
+                                    sep = ['|']
+                                    for width in col_widths:
+                                        sep.append(':' + '-' * (width + 2) + ':')
+                                    sep.append('|')
+                                    table_md.append(''.join(sep))
                         
-                            table_md.append('')  # Blank line after table
-                        
+                            table_md.append('')  # Extra spacing after table
+
                         # Add tables to page text
                         if table_md:
                             logger.info(f"Page {page_index}: Found {len(gpt4v_result)} tables")
@@ -838,18 +901,36 @@ class MarkItDown:
                 if ocr_text:
                     page_text = ocr_text
 
-        # Build final output with proper markdown headers
-        lines = [f"\n## Page {page_index}\n"]
+        # Build final output with proper markdown formatting
+        lines = []
+        
+        # Page header with proper spacing and styling
+        lines.append('\n---')  # Page separator
+        lines.append(f"## Page {page_index}")
+        lines.append('')
+        
+        # Add formatted content
         if page_text and page_text.strip():
             lines.append(page_text.strip())
+            lines.append('')
         else:
-            lines.append("[No reliable text]")
-            
-        # Add image reference if we created one
+            lines.append("*No reliable text could be extracted from this page.*")
+            lines.append('')
+        
+        # Add image reference with proper formatting
         if enhanced_path:
             rel_img_path = os.path.relpath(enhanced_path, output_dir).replace('\\', '/')
-            lines.append(f"\n![Page {page_index}]({rel_img_path})\n")
+            lines.append('<div class="page-image">')
+            lines.append(f"![Page {page_index}]({rel_img_path})")
+            lines.append('</div>')
+            lines.append('')
         
+        # Add page footer
+        lines.append('<div class="page-footer">')
+        lines.append(f"*End of Page {page_index}*")
+        lines.append('</div>')
+        lines.append('')
+
         # Return with incomplete flag if text extraction was poor
         is_incomplete = not page_text or len(page_text.strip()) < 10
         return ('\n'.join(lines), is_incomplete, enhanced_path or "")
