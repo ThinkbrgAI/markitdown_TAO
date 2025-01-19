@@ -1,13 +1,14 @@
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QProgressBar, QCheckBox,
-    QFileDialog, QComboBox, QTextEdit, QMessageBox, QGroupBox
+    QFileDialog, QComboBox, QTextEdit, QMessageBox, QGroupBox, QDialog
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 import os
 import keyring
-from typing import List, Dict
+from typing import List, Dict, Tuple
 from ._markitdown import MarkItDown, TableExtractionStrategy
+import pdfplumber.page
 
 class ConversionWorker(QThread):
     """Worker thread for folder conversion"""
@@ -86,6 +87,41 @@ class ConversionWorker(QThread):
         except Exception as e:
             self.status_update.emit(f"Worker error: {str(e)}")
 
+    def _process_single_pdf_page(self, pdf_path: str, page_index: int, page: pdfplumber.page.Page, images_dir: str, output_dir: str) -> Tuple[str, bool, str]:
+        # ... existing code ...
+
+        if gpt4v_result and isinstance(gpt4v_result, list):
+            # Format tables as markdown
+            table_md = []
+            for table in gpt4v_result:
+                if not isinstance(table, dict) or 'rows' not in table:  # Skip invalid tables
+                    continue
+                rows = table.get('rows', [])
+                if not rows or not any(row for row in rows if any(cell for cell in row)):  # Skip empty tables
+                    continue
+                
+                table_md.append('')  # Blank line before table
+                
+                # Add table title if present
+                title = table.get('title', '').strip()
+                if title:
+                    table_md.append(f"**{title}**\n")
+                
+                # Get max column count for proper alignment
+                max_cols = max(len(row) for row in rows)
+                
+                # Format each row
+                for i, row in enumerate(rows):
+                    # Pad row to max columns if needed
+                    padded_row = row + [''] * (max_cols - len(row))
+                    table_md.append('| ' + ' | '.join(str(cell) for cell in padded_row) + ' |')
+                    
+                    # Add separator after header
+                    if i == 0:
+                        table_md.append('| ' + ' | '.join(['---'] * max_cols) + ' |')
+                
+                table_md.append('')  # Blank line after table
+
 class MarkItDownUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -157,6 +193,14 @@ class MarkItDownUI(QMainWindow):
         self.enable_ocr.setChecked(True)
         ocr_layout.addWidget(self.enable_ocr)
         settings_layout.addLayout(ocr_layout)
+        
+        # Add GPT Prompt Editor
+        prompt_layout = QHBoxLayout()
+        prompt_layout.addWidget(QLabel("GPT-4V Prompt:"))
+        self.prompt_edit = QPushButton("Edit Prompt")
+        self.prompt_edit.clicked.connect(self.edit_prompt)
+        prompt_layout.addWidget(self.prompt_edit)
+        settings_layout.addLayout(prompt_layout)
         
         # Add settings to main layout
         settings_group.setLayout(settings_layout)
@@ -309,3 +353,38 @@ class MarkItDownUI(QMainWindow):
     def update_cost(self, cost: float):
         """Update the cost display"""
         self.cost_label.setText(f"${cost:.4f}") 
+    
+    def edit_prompt(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit GPT-4V Prompt")
+        layout = QVBoxLayout()
+
+        # Add text editor
+        editor = QTextEdit()
+        editor.setPlainText(self.converter.pdf_table_extractor.PROMPT_SYSTEM_GPT4V)
+        layout.addWidget(editor)
+
+        # Add buttons
+        button_box = QHBoxLayout()
+        reset_btn = QPushButton("Reset to Default")
+        save_btn = QPushButton("Save")
+        cancel_btn = QPushButton("Cancel")
+
+        reset_btn.clicked.connect(lambda: editor.setPlainText(self.converter.pdf_table_extractor.DEFAULT_PROMPT))
+        save_btn.clicked.connect(lambda: self.save_prompt(editor.toPlainText(), dialog))
+        cancel_btn.clicked.connect(dialog.reject)
+
+        button_box.addWidget(reset_btn)
+        button_box.addWidget(save_btn)
+        button_box.addWidget(cancel_btn)
+        layout.addLayout(button_box)
+
+        dialog.setLayout(layout)
+        dialog.resize(800, 600)
+        dialog.exec()
+
+    def save_prompt(self, new_prompt: str, dialog: QDialog):
+        if hasattr(self.converter, 'pdf_table_extractor'):
+            self.converter.pdf_table_extractor.PROMPT_SYSTEM_GPT4V = new_prompt
+            self.status_text.append("GPT-4V prompt updated")
+            dialog.accept() 

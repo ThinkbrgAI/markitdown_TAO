@@ -99,11 +99,68 @@ class PdfTableExtractor:
     basic no-hallucination verification, and partial fallback logic.
     """
 
-    # Central prompt or fallback prompts for GPT-4V (Section 5: Prompt Management).
-    PROMPT_SYSTEM_GPT4V = (
-        "You are an expert table extraction model. "
-        "Extract ONLY the clearly visible tables as a Python list of lists. "
-        "If no table is recognized, return []. Do not hallucinate or infer."
+    # Default prompt that can be restored
+    DEFAULT_PROMPT = (
+        "You are an expert data extraction model. Your task is to detect and extract ONLY tabular data that clearly appears in the provided image.\n\n"
+        "**What to Return**:\n"
+        "- A SINGLE Python list named `tables`.\n"
+        "- Each item in `tables` is a dictionary with two keys:\n"
+        "  1. \"title\": a string containing the table's visible title (or \"\" if none).\n"
+        "  2. \"rows\": a list of rows, each row being a list of cell strings.\n"
+        "- If there is no clearly visible table in the image, return `tables = []`.\n\n"
+        "**Example**:\n"
+        "tables = [\n"
+        "  {\n"
+        "    \"title\": \"Sales Report\",\n"
+        "    \"rows\": [\n"
+        "      [\"Column1\", \"Column2\", \"Column3\"],\n"
+        "      [\"\", \"\", \"\"],\n"
+        "      [\"Data1\", \"Data2\", \"Data3\"]\n"
+        "    ]\n"
+        "  },\n"
+        "  {\n"
+        "    \"title\": \"Other Table Title\",\n"
+        "    \"rows\": [\n"
+        "      // Another table's rows\n"
+        "    ]\n"
+        "  }\n"
+        "]\n\n"
+        "**Critical Instructions**:\n"
+        "1. **Extract Only Table Data**:\n"
+        "   - Ignore paragraphs, line items, or disclaimers not arranged in a grid/table format.\n"
+        "   - If you see a clear table heading or title above the table, store that in \"title\". If none is visible, use an empty string.\n"
+        "2. **No ASCII Art**:\n"
+        "   - Do not replicate table lines or chunk text into single characters.\n"
+        "   - Return each cell's content as a normal string, not line-by-line or character-by-character.\n"
+        "3. **No Additional Explanations**:\n"
+        "   - Return ONLY the Python object named `tables`.\n"
+        "   - Do NOT add commentary, JSON wrappers, or Markdown.\n"
+        "   - Do NOT wrap your output in quotes or code blocks.\n"
+        "4. **Exact Cell Preservation**:\n"
+        "   - If a table cell is partially unreadable, use \"\".\n"
+        "   - Keep multi-word cells in a single string.\n"
+        "   - For merged or \"section\" cells, pad columns with \"\" so every row has the same column count.\n"
+        "5. **No Hallucination**:\n"
+        "   - If text is unclear, leave it blank with \"\".\n"
+        "   - If row or column counts are uncertain, approximate based on alignment; do NOT invent data not visible.\n"
+        "6. **Multiple Tables**:\n"
+        "   - If the image shows more than one distinct table, each becomes a separate dictionary in `tables`.\n"
+        "7. **No Table**:\n"
+        "   - If no table is visible, return `tables = []`.\n\n"
+        "**Important**:\n"
+        "- Provide your final result in valid Python syntax, and nothing else.\n"
+        "- For example:\n\n"
+        "tables = [\n"
+        "  {\n"
+        "    \"title\": \"\",\n"
+        "    \"rows\": [\n"
+        "      [\"Column1\",\"Column2\",\"Column3\"],\n"
+        "      [\"\", \"\", \"\"],\n"
+        "      [\"Data1\",\"Data2\",\"Data3\"]\n"
+        "    ]\n"
+        "  }\n"
+        "]\n\n"
+        "Nothing else."
     )
 
     def __init__(self, llm_client: Optional[Any] = None, max_gpt4v_cost: float = 2.0):
@@ -125,6 +182,7 @@ class PdfTableExtractor:
         self.last_cost: float = 0.0
         self.seen_tables = set()
         self.max_gpt4v_cost = max_gpt4v_cost
+        self.PROMPT_SYSTEM_GPT4V = self.DEFAULT_PROMPT  # Initialize with default
 
         self.strategies = [
             self._extract_with_camelot,
@@ -221,53 +279,73 @@ class PdfTableExtractor:
             with open(image_path, "rb") as img_file:
                 b64_image = base64.b64encode(img_file.read()).decode()
 
-            # Updated system prompt for strict table extraction
+            # Updated system prompt for table titles
             system_message = (
                 "You are an expert data extraction model. Your task is to detect and extract ONLY tabular data that clearly appears in the provided image.\n\n"
                 "**What to Return**:\n"
                 "- A SINGLE Python list named `tables`.\n"
-                "- Each item of `tables` is a list representing a single table.\n"
-                "- Each table is a list of rows, where each row is a list of cell strings.\n"
+                "- Each item in `tables` is a dictionary with two keys:\n"
+                "  1. \"title\": a string containing the table's visible title (or \"\" if none).\n"
+                "  2. \"rows\": a list of rows, each row being a list of cell strings.\n"
                 "- If there is no clearly visible table in the image, return `tables = []`.\n\n"
                 "**Example**:\n"
                 "tables = [\n"
-                "  [\n"
-                "    [\"Column1\", \"Column2\", \"Column3\"],\n"
-                "    [\"\", \"\", \"\"],\n"
-                "    [\"Data1\", \"Data2\", \"Data3\"]\n"
-                "  ],\n"
-                "  [\n"
-                "    // Table 2, same structure\n"
-                "  ]\n"
+                "  {\n"
+                "    \"title\": \"Sales Report\",\n"
+                "    \"rows\": [\n"
+                "      [\"Column1\", \"Column2\", \"Column3\"],\n"
+                "      [\"\", \"\", \"\"],\n"
+                "      [\"Data1\", \"Data2\", \"Data3\"]\n"
+                "    ]\n"
+                "  },\n"
+                "  {\n"
+                "    \"title\": \"Other Table Title\",\n"
+                "    \"rows\": [\n"
+                "      // Another table's rows\n"
+                "    ]\n"
+                "  }\n"
                 "]\n\n"
                 "**Critical Instructions**:\n"
-                "1. **Ignore Non-Table Text**:\n"
-                "   - Skip paragraphs, line items, or disclaimers that are not arranged in a grid or table format.\n"
-                "   - Extract only the tabular data that is visually separated by grid lines or aligned rows & columns.\n"
+                "1. **Extract Only Table Data**:\n"
+                "   - Ignore paragraphs, line items, or disclaimers not arranged in a grid/table format.\n"
+                "   - If you see a clear table heading or title above the table, store that in \"title\". If none is visible, use an empty string.\n"
                 "2. **No ASCII Art**:\n"
-                "   - Do not try to replicate table lines or ASCII characters in your output.\n"
-                "   - Do not chunk text into single characters. Return each cell as a readable string.\n"
+                "   - Do not replicate table lines or chunk text into single characters.\n"
+                "   - Return each cell's content as a normal string, not line-by-line or character-by-character.\n"
                 "3. **No Additional Explanations**:\n"
                 "   - Return ONLY the Python object named `tables`.\n"
-                "   - Do NOT add commentary, JSON, or Markdown.\n"
+                "   - Do NOT add commentary, JSON wrappers, or Markdown.\n"
                 "   - Do NOT wrap your output in quotes or code blocks.\n"
                 "4. **Exact Cell Preservation**:\n"
                 "   - If a table cell is partially unreadable, use \"\".\n"
                 "   - Keep multi-word cells in a single string.\n"
-                "   - Merged or \"section\" cells get repeated or padded with \"\" so each row has the same number of columns.\n"
+                "   - For merged or \"section\" cells, pad columns with \"\" so every row has the same column count.\n"
                 "5. **No Hallucination**:\n"
                 "   - If text is unclear, leave it blank with \"\".\n"
-                "   - If a table row or column count is uncertain, approximate based on visible alignment—do NOT guess or add data not seen.\n"
+                "   - If row or column counts are uncertain, approximate based on alignment; do NOT invent data not visible.\n"
                 "6. **Multiple Tables**:\n"
-                "   - If the image shows more than one distinct table, each is a separate item in `tables`.\n"
-                "7. **If No Table**:\n"
-                "   - Return `tables = []`.\n\n"
-                "**Important**: Provide your final result exactly in valid Python syntax, nothing else."
+                "   - If the image shows more than one distinct table, each becomes a separate dictionary in `tables`.\n"
+                "7. **No Table**:\n"
+                "   - If no table is visible, return `tables = []`.\n\n"
+                "**Important**:\n"
+                "- Provide your final result in valid Python syntax, and nothing else.\n"
+                "- For example:\n\n"
+                "tables = [\n"
+                "  {\n"
+                "    \"title\": \"\",\n"
+                "    \"rows\": [\n"
+                "      [\"Column1\",\"Column2\",\"Column3\"],\n"
+                "      [\"\", \"\", \"\"],\n"
+                "      [\"Data1\",\"Data2\",\"Data3\"]\n"
+                "    ]\n"
+                "  }\n"
+                "]\n\n"
+                "Nothing else."
             )
 
             logger.info("Sending to OpenAI...")
             response = self.llm_client.chat.completions.create(
-                model="gpt-4-turbo-2024-04-09",  # Always use this model
+                model="gpt-4-turbo-2024-04-09",
                 messages=[
                     {"role": "system", "content": system_message},
                     {
@@ -297,7 +375,7 @@ class PdfTableExtractor:
                 self.last_cost = self._calculate_openai_cost("gpt-4-turbo-2024-04-09", tokens, images=1)
                 logger.info(f"Cost: ${self.last_cost:.4f} (Tokens: {tokens}, Images: 1)")
 
-            # Parse response
+            # Parse response with title support
             content = response.choices[0].message.content.strip()
             if content.startswith("tables = "):
                 content = content[len("tables = "):].strip()
@@ -718,18 +796,24 @@ class MarkItDown:
                         # Format tables as markdown
                         table_md = []
                         for table in gpt4v_result:
-                            if not table or not isinstance(table, list):  # Skip invalid tables
+                            if not isinstance(table, dict) or 'rows' not in table:  # Skip invalid tables
                                 continue
-                            if not any(row for row in table if any(cell for cell in row)):  # Skip empty tables
+                            rows = table.get('rows', [])
+                            if not rows or not any(row for row in rows if any(cell for cell in row)):  # Skip empty tables
                                 continue
                             
                             table_md.append('')  # Blank line before table
                             
+                            # Add table title if present
+                            title = table.get('title', '').strip()
+                            if title:
+                                table_md.append(f"### {title}\n")
+                            
                             # Get max column count for proper alignment
-                            max_cols = max(len(row) for row in table)
+                            max_cols = max(len(row) for row in rows)
                             
                             # Format each row
-                            for i, row in enumerate(table):
+                            for i, row in enumerate(rows):
                                 # Pad row to max columns if needed
                                 padded_row = row + [''] * (max_cols - len(row))
                                 table_md.append('| ' + ' | '.join(str(cell) for cell in padded_row) + ' |')
@@ -754,7 +838,7 @@ class MarkItDown:
                 if ocr_text:
                     page_text = ocr_text
 
-        # Build final output
+        # Build final output with proper markdown headers
         lines = [f"\n## Page {page_index}\n"]
         if page_text and page_text.strip():
             lines.append(page_text.strip())
