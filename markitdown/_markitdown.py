@@ -891,47 +891,76 @@ class PdfTableExtractor:
             max_cols = max(len(row) for row in rows)
             normalized_rows = [row + [''] * (max_cols - len(row)) for row in rows]
             
+            # Calculate optimal column widths
             col_widths = [0] * max_cols
             for row in normalized_rows:
                 for i, cell in enumerate(row):
                     col_widths[i] = max(col_widths[i], len(str(cell).strip()))
             
-            # Format header row with padding
-            header_cells = [str(cell).strip().ljust(col_widths[i]) for i, cell in enumerate(normalized_rows[0])]
+            # Determine column alignments
+            alignments = []
+            for i in range(max_cols):
+                # Check if column appears to be numeric/currency
+                is_numeric = all(
+                    str(row[i]).strip().replace('.', '').replace('-', '').replace(',', '').replace('$', '').isdigit() 
+                    for row in normalized_rows[1:]  # Skip header
+                    if i < len(row) and row[i] and str(row[i]).strip()
+                )
+                # Check if column is a short code/unit
+                is_short = all(
+                    len(str(row[i]).strip()) <= 4 
+                    for row in normalized_rows[1:]  # Skip header
+                    if i < len(row) and row[i]
+                )
+                # Long text columns should be left-aligned
+                is_long_text = any(
+                    len(str(row[i]).strip()) > 20
+                    for row in normalized_rows
+                    if i < len(row) and row[i]
+                )
+                
+                if is_numeric or is_short:
+                    alignments.append('right')
+                elif is_long_text:
+                    alignments.append('left')
+                else:
+                    alignments.append('center')
+            
+            # Format header row
+            header_cells = []
+            for i, cell in enumerate(normalized_rows[0]):
+                cell_str = str(cell).strip()
+                if alignments[i] == 'right':
+                    header_cells.append(cell_str.rjust(col_widths[i]))
+                elif alignments[i] == 'left':
+                    header_cells.append(cell_str.ljust(col_widths[i]))
+                else:
+                    header_cells.append(cell_str.center(col_widths[i]))
             formatted_lines.append('| ' + ' | '.join(header_cells) + ' |')
             
             # Add separator with alignment
             sep_cells = []
-            for i in range(max_cols):
-                width = max(col_widths[i], 3)  # Minimum width of 3
-                # Check if column appears to be numeric/currency
-                is_numeric = all(
-                    str(row[i]).strip().replace('.', '').replace('-', '').replace(',', '').replace('$', '').isdigit() 
-                    for row in normalized_rows[1:]
-                    if i < len(row) and row[i] and str(row[i]).strip()
-                )
-                # Check if column is a unit/code column (short text)
-                is_unit = (
-                    i in [0, 1, 2]  # First three columns are typically codes/units
-                    or all(len(str(row[i]).strip()) <= 4 for row in normalized_rows[1:] if row[i])
-                )
-                
-                if is_numeric or is_unit:
-                    sep_cells.append('-' * width + ':')  # Right align
+            for i, width in enumerate(col_widths):
+                width = max(width, 3)  # Minimum width
+                if alignments[i] == 'right':
+                    sep_cells.append('-' * (width - 1) + ':')
+                elif alignments[i] == 'left':
+                    sep_cells.append(':' + '-' * (width - 1))
                 else:
-                    sep_cells.append(':' + '-' * width)  # Left align
+                    sep_cells.append(':' + '-' * (width - 2) + ':')
             formatted_lines.append('| ' + ' | '.join(sep_cells) + ' |')
             
-            # Add data rows with padding
+            # Format data rows
             for row in normalized_rows[1:]:
                 cells = []
                 for i, cell in enumerate(row):
                     cell_str = str(cell).strip()
-                    # Right-align numeric/currency values and short codes
-                    if (cell_str and (cell_str[0].isdigit() or cell_str.startswith('$'))) or i in [0, 1, 2]:
+                    if alignments[i] == 'right':
                         cells.append(cell_str.rjust(col_widths[i]))
-                    else:
+                    elif alignments[i] == 'left':
                         cells.append(cell_str.ljust(col_widths[i]))
+                    else:
+                        cells.append(cell_str.center(col_widths[i]))
                 formatted_lines.append('| ' + ' | '.join(cells) + ' |')
             
             # Add spacing after table
