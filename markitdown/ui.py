@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 import os
 import keyring
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from ._markitdown import MarkItDown, TableExtractionStrategy
 import pdfplumber.page
 
@@ -50,14 +50,14 @@ class ConversionWorker(QThread):
                     self.current_file.emit(rel_path)
                     self.status_update.emit(f"Converting: {rel_path}")
                     
-                    # Convert file
-                    result = md.convert(file_path)
+                    # Convert file - returns string now, not ConversionResult
+                    result = md.convert_file(file_path, self.output_dir)
                     
                     # Update total cost if available
-                    if hasattr(md.pdf_table_extractor, 'last_cost'):
-                        self.total_cost += md.pdf_table_extractor.last_cost
-                        self.cost_update.emit(self.total_cost)
-                        self.status_update.emit(f"Page cost: ${md.pdf_table_extractor.last_cost:.4f}")
+                    page_cost = md.pdf_table_extractor.last_cost
+                    self.total_cost += page_cost
+                    self.cost_update.emit(self.total_cost)
+                    self.status_update.emit(f"Page cost: ${page_cost:.4f}")
                     
                     # Create relative output path
                     rel_output = os.path.relpath(file_path, self.input_dir)
@@ -67,9 +67,9 @@ class ConversionWorker(QThread):
                     # Create output directory if needed
                     os.makedirs(os.path.dirname(output_path), exist_ok=True)
                     
-                    # Save result
+                    # Save result (now a string)
                     with open(output_path, 'w', encoding='utf-8') as f:
-                        f.write(result.text_content)
+                        f.write(result)
                     
                     self.status_update.emit(f"Completed: {rel_path}")
                     
@@ -388,3 +388,40 @@ class MarkItDownUI(QMainWindow):
             self.converter.pdf_table_extractor.PROMPT_SYSTEM_GPT4V = new_prompt
             self.status_text.append("GPT-4V prompt updated")
             dialog.accept() 
+
+def process_files(input_path: str, output_dir: Optional[str] = None, 
+                 table_strategy: str = "auto", max_gpt4v_cost: float = 2.0) -> None:
+    """Process all PDF files in a directory or a single file."""
+    
+    # Initialize converter
+    converter = MarkItDown(
+        llm_client=os.getenv("OPENAI_API_KEY"),
+        max_gpt4v_cost=max_gpt4v_cost,
+        table_strategy=table_strategy
+    )
+    
+    total_cost = 0.0
+    files_processed = 0
+    
+    print(f"Starting conversion of {input_path}...")
+    
+    if os.path.isfile(input_path):
+        files = [input_path]
+    else:
+        files = [os.path.join(input_path, f) for f in os.listdir(input_path) 
+                if f.lower().endswith('.pdf')]
+    
+    for file_path in files:
+        print(f"Converting: {os.path.basename(file_path)}")
+        try:
+            # Change this line from converter.convert to converter.convert_file
+            output_path = converter.convert_file(file_path, output_dir)
+            files_processed += 1
+            # Add cost from table extractor
+            total_cost += converter.pdf_table_extractor.last_cost
+        except Exception as e:
+            print(f"Error converting {os.path.basename(file_path)}: {str(e)}")
+    
+    print(f"Processed {files_processed} files")
+    print(f"Total OpenAI cost: ${total_cost:.4f}")
+    print("Conversion completed!") 
