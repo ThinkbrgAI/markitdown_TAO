@@ -1203,33 +1203,41 @@ class MarkItDown:
         # 3. Format everything as markdown
         lines = []
         
-        # Header
+        # Header with proper spacing
         lines.extend([
+            '',  # Extra space before page header
             '---',
             f"## Page {page_index}",
             ''
         ])
         
-        # Text content
+        # Text content with enhanced formatting
         if content['text'].strip():
-            formatted_text = content['text']  # Basic formatting for now
+            formatted_text = self._format_text_content(content['text'])
             if formatted_text:
                 lines.append(formatted_text)
-                lines.append('')
         
-        # Tables
+        # Tables (existing table formatting)
         if content['tables']:
             for table in content['tables']:
                 table_lines = self.pdf_table_extractor._format_gpt4v_tables([table])
                 lines.extend(table_lines)
         
-        # Images
+        # Images with enhanced captions
         for img in content['images']:
             lines.extend([
+                '',  # Extra spacing before image
                 f"![Page {img['page']} - Enhanced scan]({img['path']})",
-                f"*Page {img['page']} of document*",
-                ''
+                f"*Page {img['page']} of document - Enhanced and processed for clarity*",
+                ''  # Extra spacing after image
             ])
+        
+        # Add page separator if not the last page
+        lines.extend([
+            '',
+            '<div style="page-break-after: always;"></div>',
+            ''
+        ])
         
         # Return with completion status
         text_content = '\n'.join(lines)
@@ -1298,3 +1306,117 @@ class MarkItDown:
 
     def _handle_msg(self, file_path: str) -> Dict[str, Any]:
         raise NotImplementedError("MSG handling not implemented yet")
+
+    def _format_text_content(self, text: str) -> str:
+        """Format regular text content with enhanced markdown rules."""
+        if not text:
+            return ""
+        
+        lines = []
+        current_paragraph = []
+        in_section = False
+        
+        # Common section header patterns
+        section_patterns = [
+            r'^(?:SECTION|Section)\s+\d+[.:]\s*(.+)$',  # Section 1: Title
+            r'^\d+\.\s*[A-Z][^a-z]+[.:]\s*(.+)$',       # 1. DESCRIPTION: content
+            r'^[A-Z][^a-z\d]{3,}[.:]\s*(.+)$',          # DESCRIPTION: content
+            r'^(?:PART|Part)\s+\d+[.:]\s*(.+)$',        # Part 1: Title
+            r'^(?:\d+\.)+\s+(.+)$',                      # 1.1. Title or 1.1.1. Title
+        ]
+        
+        # Common field label patterns
+        field_patterns = [
+            r'^((?:Project|Contract|Document|Reference)\s+(?:No|Number|ID|Title))\s*[:.](.+)$',
+            r'^(Date|Time|Location|Address|Client|Contractor)\s*[:.](.+)$',
+            r'^(Prepared By|Reviewed By|Approved By|Submitted By)\s*[:.](.+)$',
+        ]
+        
+        for line in text.split('\n'):
+            line = line.strip()
+            
+            # Skip empty lines at start of sections
+            if not line and not current_paragraph and not lines:
+                continue
+            
+            # Check for section headers
+            is_section = False
+            for pattern in section_patterns:
+                if re.match(pattern, line, re.IGNORECASE):
+                    if current_paragraph:
+                        lines.append(' '.join(current_paragraph))
+                        lines.append('')
+                        current_paragraph = []
+                    
+                    # Add extra spacing before sections
+                    if lines and not lines[-1].startswith('#'):
+                        lines.extend(['', ''])
+                    
+                    lines.extend([f"### {line}", ''])
+                    in_section = True
+                    is_section = True
+                    break
+            
+            if is_section:
+                continue
+            
+            # Check for field labels
+            is_field = False
+            for pattern in field_patterns:
+                match = re.match(pattern, line, re.IGNORECASE)
+                if match:
+                    if current_paragraph:
+                        lines.append(' '.join(current_paragraph))
+                        lines.append('')
+                        current_paragraph = []
+                    
+                    label, value = match.groups()
+                    lines.append(f"**{label.strip()}:** {value.strip()}")
+                    is_field = True
+                    break
+            
+            if is_field:
+                continue
+            
+            # Handle lists with better indentation
+            list_match = re.match(r'^(\d+\.|[-•*])\s+(.+)$', line)
+            if list_match:
+                if current_paragraph:
+                    lines.append(' '.join(current_paragraph))
+                    lines.append('')
+                    current_paragraph = []
+                prefix = list_match.group(1)
+                content = list_match.group(2)
+                if prefix in ['-', '•', '*']:
+                    lines.append(f"- {content}")
+                else:
+                    lines.append(f"1. {content}")
+                continue
+            
+            # Handle emphasis for important text
+            if line.isupper() and len(line) > 3:
+                line = f"**{line.title()}**"
+            
+            # Handle dates, times, measurements as before
+            line = re.sub(r'(\d{1,2}/\d{1,2}/\d{2,4})', r'**\1**', line)
+            line = re.sub(r'(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm))', r'**\1**', line)
+            line = re.sub(r'(\d+(?:\.\d+)?)\s*((?:ft|in|cm|mm|m|kg|lb|oz)\b)', r'**\1** \2', line)
+            line = re.sub(r'(\$\d+(?:,\d{3})*(?:\.\d{2})?)', r'**\1**', line)
+            
+            # Paragraph handling with better section awareness
+            if line:
+                current_paragraph.append(line)
+            else:
+                if current_paragraph:
+                    lines.append(' '.join(current_paragraph))
+                    lines.append('')
+                    current_paragraph = []
+                elif in_section and lines and lines[-1]:  # Add spacing between sections
+                    lines.append('')
+        
+        # Handle any remaining paragraph
+        if current_paragraph:
+            lines.append(' '.join(current_paragraph))
+            lines.append('')
+        
+        return '\n'.join(lines)
